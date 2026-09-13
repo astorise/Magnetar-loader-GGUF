@@ -171,23 +171,44 @@ impl GgufTokenizer {
             }
         }
 
+        // `TokenizerMetadata::validate` rejects two special tokens sharing
+        // the same id, regardless of kind -- a real constraint this
+        // ingestor must satisfy exactly like `HuggingFaceTokenizer` does,
+        // not a GGUF-specific relaxation. A real Hugging Face
+        // `tokenizer_config.json` for a Qwen2 checkpoint commonly *omits*
+        // `bos_token` entirely (Qwen2 has no true distinct
+        // beginning-of-sequence token), so `HuggingFaceTokenizer` never
+        // even attempts to register one there -- but GGUF's key-value
+        // schema always writes a `tokenizer.ggml.bos_token_id` (llama.cpp's
+        // real writer convention defaults it to the same id as
+        // `eos_token_id` when the source model has no distinct one,
+        // discovered running this ingestor against a real downloaded
+        // Qwen2.5-0.5B-Instruct GGUF file, whose bos/eos ids are
+        // identical). Registering ids in eos, bos, pad order and skipping
+        // one that would collide with an id already claimed reproduces
+        // exactly what the Hugging Face path's own field-omission already
+        // achieves for the same real model.
         let mut special_tokens = Vec::new();
+        let mut claimed_ids = std::collections::BTreeSet::new();
         let mut push_special = |kind: SpecialTokenKind, id: Option<u64>| {
             let Some(id) = id.and_then(|id| u32::try_from(id).ok()) else {
                 return;
             };
+            if !claimed_ids.insert(id) {
+                return;
+            }
             let Some(text) = tokens.get(id as usize) else {
                 return;
             };
             special_tokens.push(SpecialToken::new(kind, *text, id));
         };
         push_special(
-            SpecialTokenKind::Bos,
-            uint_value(metadata, "tokenizer.ggml.bos_token_id"),
-        );
-        push_special(
             SpecialTokenKind::Eos,
             uint_value(metadata, "tokenizer.ggml.eos_token_id"),
+        );
+        push_special(
+            SpecialTokenKind::Bos,
+            uint_value(metadata, "tokenizer.ggml.bos_token_id"),
         );
         push_special(
             SpecialTokenKind::Pad,
@@ -343,5 +364,94 @@ impl Tokenizer for GgufTokenizer {
             pending_partial_state: None,
             diagnostics: Vec::new(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_metadata_with(
+        bos: Option<u32>,
+        eos: Option<u32>,
+    ) -> BTreeMap<String, GgufMetadataValue> {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "tokenizer.ggml.model".into(),
+            GgufMetadataValue::String("gpt2".into()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufMetadataValue::Array(vec![
+                GgufMetadataValue::String("<|endoftext|>".into()),
+                GgufMetadataValue::String("hello".into()),
+                GgufMetadataValue::String("world".into()),
+            ]),
+        );
+        metadata.insert(
+            "tokenizer.ggml.merges".into(),
+            GgufMetadataValue::Array(Vec::new()),
+        );
+        if let Some(bos) = bos {
+            metadata.insert(
+                "tokenizer.ggml.bos_token_id".into(),
+                GgufMetadataValue::UInt32(bos),
+            );
+        }
+        if let Some(eos) = eos {
+            metadata.insert(
+                "tokenizer.ggml.eos_token_id".into(),
+                GgufMetadataValue::UInt32(eos),
+            );
+        }
+        metadata
+    }
+
+    /// A real, discovered bug: llama.cpp's GGUF writer always declares
+    /// `tokenizer.ggml.bos_token_id`, defaulting it to the same id as
+    /// `eos_token_id` for a model with no distinct BOS (Qwen2.5-0.5B-
+    /// Instruct's real GGUF export does exactly this) --
+    /// `TokenizerMetadata::validate` rejects two special tokens sharing
+    /// one id regardless of kind, so both must not be registered.
+    #[test]
+    fn shared_bos_eos_id_does_not_conflict() {
+        let metadata = tiny_metadata_with(Some(0), Some(0));
+        let tokenizer = GgufTokenizer::from_gguf_metadata(&metadata, "conflict-test", Some(3))
+            .expect("a shared bos/eos id must not be treated as a validation conflict");
+        assert!(
+            tokenizer
+                .metadata()
+                .special_token(SpecialTokenKind::Eos)
+                .is_some(),
+            "eos must still be registered"
+        );
+        assert!(
+            tokenizer
+                .metadata()
+                .special_token(SpecialTokenKind::Bos)
+                .is_none(),
+            "bos must be skipped once eos already claimed the same id"
+        );
+    }
+
+    #[test]
+    fn distinct_bos_and_eos_ids_are_both_registered() {
+        let metadata = tiny_metadata_with(Some(0), Some(1));
+        let tokenizer = GgufTokenizer::from_gguf_metadata(&metadata, "distinct-test", Some(3))
+            .expect("distinct bos/eos ids build successfully");
+        assert_eq!(
+            tokenizer
+                .metadata()
+                .special_token(SpecialTokenKind::Bos)
+                .map(|token| token.id),
+            Some(0)
+        );
+        assert_eq!(
+            tokenizer
+                .metadata()
+                .special_token(SpecialTokenKind::Eos)
+                .map(|token| token.id),
+            Some(1)
+        );
     }
 }
