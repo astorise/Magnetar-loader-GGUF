@@ -97,25 +97,25 @@ impl ProductionArtifactPayloadSource for GgufPayloadSource {
     }
 }
 
-/// Discovers and parses this bundle's single `model.gguf` file, returning
-/// the normalized (renamed, shape-reversed) tensor inventory plus a
-/// bounded payload source, and the file's raw metadata for architecture/
-/// tokenizer normalization.
+/// [`discover_and_parse_weights`]'s success value: the normalized
+/// (renamed, shape-reversed) tensor inventory, a bounded payload source,
+/// and the file's raw key-value metadata for architecture/tokenizer
+/// normalization.
+type DiscoveredGgufWeights = (
+    Vec<ModelTensorMetadata>,
+    GgufPayloadSource,
+    BTreeMap<String, magnetar_format_gguf::GgufMetadataValue>,
+);
+
+/// Discovers and parses this bundle's single `model.gguf` file.
 pub fn discover_and_parse_weights(
     source: &ProductionModelSource,
-) -> Result<
-    (
-        Vec<ModelTensorMetadata>,
-        GgufPayloadSource,
-        std::collections::BTreeMap<String, magnetar_format_gguf::GgufMetadataValue>,
-    ),
-    ProductionIngestionError,
-> {
-    let path = source
-        .resolve(GGUF_FILE_NAME)
-        .map_err(|_| ProductionIngestionError::RequiredPartMissing {
+) -> Result<DiscoveredGgufWeights, ProductionIngestionError> {
+    let path = source.resolve(GGUF_FILE_NAME).map_err(|_| {
+        ProductionIngestionError::RequiredPartMissing {
             part: GGUF_FILE_NAME.to_string(),
-        })?;
+        }
+    })?;
     let bytes = fs::read(&path).map_err(|error| ProductionIngestionError::RequiredPartMissing {
         part: format!("{} ({error})", path.display()),
     })?;
@@ -286,7 +286,10 @@ mod tests {
             ))
         );
 
-        let embedding = tensors.iter().find(|t| t.name == "token_embedding").unwrap();
+        let embedding = tensors
+            .iter()
+            .find(|t| t.name == "token_embedding")
+            .unwrap();
         // GGUF's ne order [4, 2] must be reversed to PyTorch row-major [2, 4].
         assert_eq!(embedding.shape, vec![2, 4]);
 

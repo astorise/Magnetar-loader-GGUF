@@ -83,9 +83,8 @@ pub fn normalize(
     metadata: &BTreeMap<String, GgufMetadataValue>,
     vocab_size: u64,
 ) -> Result<ModelArchitectureConfig, ProductionIngestionError> {
-    let architecture = string_value(metadata, "general.architecture").ok_or_else(|| {
-        malformed("GGUF metadata is missing required key 'general.architecture'")
-    })?;
+    let architecture = string_value(metadata, "general.architecture")
+        .ok_or_else(|| malformed("GGUF metadata is missing required key 'general.architecture'"))?;
     if architecture != SUPPORTED_ARCHITECTURE {
         return Err(ProductionIngestionError::UnsupportedFormat {
             reason: format!(
@@ -97,15 +96,12 @@ pub fn normalize(
 
     let hidden_size = required_uint(metadata, "qwen2.embedding_length")?;
     let intermediate_size = required_uint(metadata, "qwen2.feed_forward_length")?;
-    let num_hidden_layers =
-        u32::try_from(required_uint(metadata, "qwen2.block_count")?).map_err(|_| {
-            malformed("GGUF metadata's 'qwen2.block_count' does not fit in a u32")
+    let num_hidden_layers = u32::try_from(required_uint(metadata, "qwen2.block_count")?)
+        .map_err(|_| malformed("GGUF metadata's 'qwen2.block_count' does not fit in a u32"))?;
+    let num_attention_heads = u32::try_from(required_uint(metadata, "qwen2.attention.head_count")?)
+        .map_err(|_| {
+            malformed("GGUF metadata's 'qwen2.attention.head_count' does not fit in a u32")
         })?;
-    let num_attention_heads = u32::try_from(required_uint(
-        metadata,
-        "qwen2.attention.head_count",
-    )?)
-    .map_err(|_| malformed("GGUF metadata's 'qwen2.attention.head_count' does not fit in a u32"))?;
     let num_key_value_heads = match uint_value(metadata, "qwen2.attention.head_count_kv") {
         Some(value) => u32::try_from(value).map_err(|_| {
             malformed("GGUF metadata's 'qwen2.attention.head_count_kv' does not fit in a u32")
@@ -154,7 +150,9 @@ pub fn normalize(
         float_value(metadata, "qwen2.attention.layer_norm_rms_epsilon").unwrap_or(1e-6) as f32;
     let rope_theta = float_value(metadata, "qwen2.rope.freq_base").unwrap_or(10_000.0);
     if rope_theta <= 0.0 {
-        return Err(malformed("GGUF metadata's qwen2.rope.freq_base must be positive"));
+        return Err(malformed(
+            "GGUF metadata's qwen2.rope.freq_base must be positive",
+        ));
     }
 
     let architecture_config = ModelArchitectureConfig {
@@ -178,9 +176,11 @@ pub fn normalize(
         eos_token_id: uint_value(metadata, "tokenizer.ggml.eos_token_id")
             .and_then(|value| u32::try_from(value).ok()),
     };
-    architecture_config
-        .validate()
-        .map_err(|error| malformed(format!("GGUF metadata produced an inconsistent architecture config: {error}")))?;
+    architecture_config.validate().map_err(|error| {
+        malformed(format!(
+            "GGUF metadata produced an inconsistent architecture config: {error}"
+        ))
+    })?;
 
     Ok(architecture_config)
 }

@@ -94,13 +94,15 @@ impl GgufTokenizer {
             });
         }
 
-        let tokens = string_array(metadata, "tokenizer.ggml.tokens")
-            .ok_or_else(|| malformed("GGUF metadata is missing required key 'tokenizer.ggml.tokens'"))?;
+        let tokens = string_array(metadata, "tokenizer.ggml.tokens").ok_or_else(|| {
+            malformed("GGUF metadata is missing required key 'tokenizer.ggml.tokens'")
+        })?;
         if tokens.is_empty() {
             return Err(malformed("GGUF metadata's tokenizer.ggml.tokens is empty"));
         }
-        let merges_raw = string_array(metadata, "tokenizer.ggml.merges")
-            .ok_or_else(|| malformed("GGUF metadata is missing required key 'tokenizer.ggml.merges'"))?;
+        let merges_raw = string_array(metadata, "tokenizer.ggml.merges").ok_or_else(|| {
+            malformed("GGUF metadata is missing required key 'tokenizer.ggml.merges'")
+        })?;
 
         let vocabulary_size = tokens.len() as u32;
         if let Some(expected) = expected_vocab_size
@@ -135,7 +137,11 @@ impl GgufTokenizer {
             .vocab_and_merges(vocab, merges)
             .byte_fallback(false)
             .build()
-            .map_err(|error| malformed(format!("GGUF vocabulary failed to build a BPE model: {error}")))?;
+            .map_err(|error| {
+                malformed(format!(
+                    "GGUF vocabulary failed to build a BPE model: {error}"
+                ))
+            })?;
 
         let mut inner = HfTokenizerImpl::new(bpe);
         inner.with_pre_tokenizer(Some(ByteLevel::default()));
@@ -146,7 +152,9 @@ impl GgufTokenizer {
         // it is never split by BPE merging and is correctly excluded by
         // `skip_special_tokens` at decode time, exactly like a real
         // `tokenizer.json`'s own `added_tokens` entries.
-        if let Some(GgufMetadataValue::Array(token_types)) = metadata.get("tokenizer.ggml.token_type") {
+        if let Some(GgufMetadataValue::Array(token_types)) =
+            metadata.get("tokenizer.ggml.token_type")
+        {
             const CONTROL_TOKEN_TYPE: i32 = 3;
             let special_tokens: Vec<AddedToken> = token_types
                 .iter()
@@ -195,10 +203,14 @@ impl GgufTokenizer {
 
         let artifact_id = artifact_id.into();
         let tokenizer_metadata = TokenizerMetadata {
-            id: TokenizerId::new(&artifact_id)
-                .map_err(|error| malformed(format!("invalid tokenizer id '{artifact_id}': {error}")))?,
-            artifact: TokenizerArtifactId::new(&artifact_id)
-                .map_err(|error| malformed(format!("invalid tokenizer artifact id '{artifact_id}': {error}")))?,
+            id: TokenizerId::new(&artifact_id).map_err(|error| {
+                malformed(format!("invalid tokenizer id '{artifact_id}': {error}"))
+            })?,
+            artifact: TokenizerArtifactId::new(&artifact_id).map_err(|error| {
+                malformed(format!(
+                    "invalid tokenizer artifact id '{artifact_id}': {error}"
+                ))
+            })?,
             digest: ModelDigest::sha256(
                 tokens
                     .iter()
@@ -207,7 +219,8 @@ impl GgufTokenizer {
                     .collect::<Vec<u8>>()
                     .as_slice(),
             ),
-            family: TokenizerFamily::new("gguf-gpt2-bpe").map_err(|error| malformed(error.to_string()))?,
+            family: TokenizerFamily::new("gguf-gpt2-bpe")
+                .map_err(|error| malformed(error.to_string()))?,
             revision: TokenizerRevision::new("1").map_err(|error| malformed(error.to_string()))?,
             vocabulary_size,
             added_token_count: inner.get_added_tokens_decoder().len() as u32,

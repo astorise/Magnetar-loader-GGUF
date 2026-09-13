@@ -90,11 +90,11 @@ fn sanitize_model_name(raw: &str) -> String {
 pub fn load_gguf_chat_template(
     source: &ProductionModelSource,
 ) -> Result<Option<String>, ProductionIngestionError> {
-    let path = source
-        .resolve(GGUF_FILE_NAME)
-        .map_err(|_| ProductionIngestionError::RequiredPartMissing {
+    let path = source.resolve(GGUF_FILE_NAME).map_err(|_| {
+        ProductionIngestionError::RequiredPartMissing {
             part: GGUF_FILE_NAME.to_string(),
-        })?;
+        }
+    })?;
     let bytes = fs::read(&path).map_err(|error| ProductionIngestionError::RequiredPartMissing {
         part: format!("{} ({error})", path.display()),
     })?;
@@ -103,12 +103,10 @@ pub fn load_gguf_chat_template(
             reason: format!("{GGUF_FILE_NAME} failed to parse as GGUF: {error}"),
         }
     })?;
-    Ok(
-        match artifact.metadata.get("tokenizer.chat_template") {
-            Some(GgufMetadataValue::String(template)) => Some(template.clone()),
-            _ => None,
-        },
-    )
+    Ok(match artifact.metadata.get("tokenizer.chat_template") {
+        Some(GgufMetadataValue::String(template)) => Some(template.clone()),
+        _ => None,
+    })
 }
 
 impl ProductionModelArtifactIngestor for GgufIngestor {
@@ -155,7 +153,8 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
         // change's design.md for the sourced research) -- the Component
         // expects `[in_features, out_features]` instead; see
         // `weight_layout.rs`.
-        let transposing_source = weight_layout::TransposingPayloadSource::new(payload_source, &tensors);
+        let transposing_source =
+            weight_layout::TransposingPayloadSource::new(payload_source, &tensors);
         weight_layout::swap_declared_projection_shapes(&mut tensors);
 
         let token_embedding = tensors
@@ -170,12 +169,15 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
                  tensor was found",
             );
             Arc::new(
-                derived_lm_head::DerivedLmHeadPayloadSource::new(transposing_source, &token_embedding)
-                    .ok_or_else(|| ProductionIngestionError::MalformedMetadata {
-                        reason: "token_embedding is missing the offset/size/shape metadata \
+                derived_lm_head::DerivedLmHeadPayloadSource::new(
+                    transposing_source,
+                    &token_embedding,
+                )
+                .ok_or_else(|| ProductionIngestionError::MalformedMetadata {
+                    reason: "token_embedding is missing the offset/size/shape metadata \
                                  needed to derive a tied lm_head"
-                            .into(),
-                    })?,
+                        .into(),
+                })?,
             )
         } else {
             Arc::new(transposing_source)
@@ -261,8 +263,10 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
             ModelName::new(name).map_err(|error| ProductionIngestionError::MalformedMetadata {
                 reason: error.to_string(),
             })?,
-            ModelRevision::new("local").map_err(|error| ProductionIngestionError::MalformedMetadata {
-                reason: error.to_string(),
+            ModelRevision::new("local").map_err(|error| {
+                ProductionIngestionError::MalformedMetadata {
+                    reason: error.to_string(),
+                }
             })?,
             file_digest,
         );
@@ -306,6 +310,7 @@ mod tests {
     use super::*;
     use magnetar_runtime::ModelArtifactSource;
     use magnetar_runtime::model::ModelTrustStore;
+    use magnetar_runtime::tokenizer::Tokenizer as _;
 
     fn le_u32(value: u32) -> Vec<u8> {
         value.to_le_bytes().to_vec()
@@ -391,13 +396,15 @@ mod tests {
     }
 
     /// A minimal but complete, real Qwen2 GGUF byte blob: architecture
-    /// metadata, an embedded byte-level BPE vocabulary/merges, and every
-    /// tensor a single-layer Qwen2 decoder needs (attention + MLP + norms
-    /// + embedding), tied (`output.weight` deliberately absent). hidden=2,
-    /// heads=1, kv_heads=1, intermediate=4, layers=1, vocab=4 -- small
-    /// enough to hand-write every tensor's real values, large enough that
-    /// a transpose/shape bug on a non-square projection would not be
-    /// masked by every dimension being equal.
+    /// metadata, an embedded byte-level BPE vocabulary and merges, and
+    /// every tensor a single-layer Qwen2 decoder needs (attention, MLP,
+    /// norms, and embedding), tied (`output.weight` deliberately absent).
+    ///
+    /// Dimensions (hidden 2, heads 1, kv_heads 1, intermediate 4, layers
+    /// 1, vocab 4) are small enough to hand-write every tensor's real
+    /// values, and large enough that a transpose or shape bug on a
+    /// non-square projection would not be masked by every dimension
+    /// being equal.
     fn tiny_qwen2_gguf() -> Vec<u8> {
         let kvs = vec![
             kv_string("general.architecture", "qwen2"),
@@ -522,7 +529,11 @@ mod tests {
             .iter()
             .find(|tensor| tensor.name == "lm_head")
             .expect("a synthetic lm_head tensor was derived from token_embedding");
-        assert_eq!(lm_head.shape, vec![2, 4], "hidden x vocab, as the Component expects");
+        assert_eq!(
+            lm_head.shape,
+            vec![2, 4],
+            "hidden x vocab, as the Component expects"
+        );
 
         // Parsing/normalizing alone never grants trust (Decision 2).
         let trust = ModelTrustStore::default().evaluate(&result.manifest);
@@ -614,7 +625,10 @@ mod tests {
             ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
             dir.path().to_path_buf(),
         );
-        let error = GgufIngestor::new().ingest(&source).unwrap_err();
+        let error = match GgufIngestor::new().ingest(&source) {
+            Err(error) => error,
+            Ok(_) => panic!("expected an unsupported-format error"),
+        };
         assert!(matches!(
             error,
             ProductionIngestionError::UnsupportedFormat { .. }
@@ -628,7 +642,10 @@ mod tests {
             ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
             dir.path().to_path_buf(),
         );
-        let error = GgufIngestor::new().ingest(&source).unwrap_err();
+        let error = match GgufIngestor::new().ingest(&source) {
+            Err(error) => error,
+            Ok(_) => panic!("expected a required-part-missing error"),
+        };
         assert!(matches!(
             error,
             ProductionIngestionError::RequiredPartMissing { .. }

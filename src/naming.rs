@@ -94,7 +94,9 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
     }
 
     Err(ProductionIngestionError::MalformedMetadata {
-        reason: format!("tensor '{raw}' does not match any recognized Qwen2 GGUF tensor name shape"),
+        reason: format!(
+            "tensor '{raw}' does not match any recognized Qwen2 GGUF tensor name shape"
+        ),
     })
 }
 
