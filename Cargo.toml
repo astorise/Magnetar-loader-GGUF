@@ -1,0 +1,34 @@
+[workspace]
+
+[package]
+name = "magnetar-loader-gguf"
+version = "0.1.0"
+edition = "2024"
+# Never published to crates.io independently -- this crate is only
+# buildable from within a checkout of the parent Magnetar repository,
+# matching every other externalized module's own Cargo.toml
+# (`loaders/huggingface`, `providers/cpu`, `formats/safetensors`, ...).
+publish = false
+
+[dependencies]
+# Path dependencies, not published crates: this crate is only buildable
+# from within a checkout of the parent Magnetar repository, with this
+# submodule checked out at `loaders/gguf` (matching CI's `submodules:
+# recursive` checkout and the same pattern every other externalized
+# module uses). `magnetar-runtime` supplies the generic production-model-
+# ingestion contract this crate implements; `magnetar-format-gguf`
+# supplies the real GGUF container parser this crate composes rather than
+# reimplementing.
+magnetar-runtime = { path = "../../magnetar-runtime" }
+magnetar-format-gguf = { path = "../../formats/gguf" }
+# Real GGUF-embedded-vocabulary tokenizer construction (byte-level BPE,
+# matching Qwen2's real tokenizer shape): built programmatically from the
+# GGUF file's own `tokenizer.ggml.tokens`/`merges` arrays via `tokenizers`'
+# `BPE::builder().vocab_and_merges(...)`, never a `tokenizer.json` file
+# (GGUF embeds the vocabulary directly, unlike a Hugging Face bundle).
+# Kept out of `magnetar-runtime` entirely, matching `loaders/huggingface`'s
+# own use of this crate.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+[dev-dependencies]
+tempfile = "3"
