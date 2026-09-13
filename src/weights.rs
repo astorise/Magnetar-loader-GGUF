@@ -5,14 +5,23 @@
 //! Hugging Face's separate/sharded Safetensors files, so there is no
 //! shard discovery step here -- only one file to resolve and parse.
 //!
-//! Quantization is out of scope for this ingestor (a separate,
-//! not-yet-implemented Magnetar chantier: dequantization-at-load or
-//! quantized compute kernels do not exist yet) -- any tensor GGUF
-//! declares with a quantized `ggml_type` (`Q4_K`/`Q5_K`/`Q8_0`) is
-//! rejected structurally, not silently accepted and later failed deep
-//! inside weight materialization.
+//! A quantized tensor (`Q8_0`/`Q4_K`/`Q5_K`) is dequantized to `F32` right
+//! here, at payload-read time, *before* `weight_layout.rs`'s projection
+//! transpose ever sees it (`resolve-gguf-quantized-projection-transpose-sequencing`):
+//! that transpose assumes a flat per-element byte width, which is
+//! meaningless for block-quantized data, so dequantizing first and
+//! presenting the result as plain `F32` (overriding the discovered
+//! tensor's declared `storage_dtype`/`size_bytes`/`quantization`
+//! accordingly) means every later step in this crate's pipeline treats a
+//! formerly-quantized tensor exactly like a real `F32` one, with no
+//! special-casing needed downstream. `magnetar-runtime`'s own generic
+//! `Q8_0`/`Q4_K`/`Q5_K` dequantization
+//! (`support-gguf-quantized-tensor-dequantization`) is consequently never
+//! reached for a GGUF-sourced tensor -- this crate fully resolves to `F32`
+//! before Model Loading ever sees it.
 
-use magnetar_runtime::model::ModelTensorMetadata;
+use crate::dequantize;
+use magnetar_runtime::model::{ModelDType, ModelTensorMetadata};
 use magnetar_runtime::production_model_ingestion::{
     ProductionArtifactPayloadSource, ProductionIngestionError, ProductionModelSource,
     ProductionPayloadRange,
@@ -26,16 +35,43 @@ use std::{
 
 const GGUF_FILE_NAME: &str = "model.gguf";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TensorSource {
+    Plain,
+    Q8_0,
+    Q4K,
+    Q5K,
+}
+
+/// One tensor's location in the original GGUF file, and how to turn its
+/// raw bytes into what Model Loading actually requests. `file_offset`/
+/// `file_length` describe the *original* bytes as declared by
+/// `magnetar-format-gguf` (quantized or not); `declared_length` is what a
+/// caller's `ProductionPayloadRange.length` must equal -- the same as
+/// `file_length` for [`TensorSource::Plain`], or the dequantized `F32`
+/// byte count otherwise (matching the overridden `size_bytes` this
+/// crate's [`discover_and_parse_weights`] puts on the returned
+/// `ModelTensorMetadata`).
 #[derive(Debug)]
 struct TensorLocation {
-    offset: u64,
-    length: u64,
+    file_offset: u64,
+    file_length: u64,
+    declared_length: u64,
+    source: TensorSource,
+}
+
+fn f32_le_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
 }
 
 /// Bounded, on-demand [`ProductionArtifactPayloadSource`] for a GGUF file:
 /// `read_payload` opens the file, seeks to `tensor_data_start + offset`,
-/// and reads exactly that many bytes -- it never holds the whole file's
-/// bytes in memory across calls, matching
+/// reads exactly the *original* bytes, and (for a quantized tensor)
+/// dequantizes them to `F32` before returning -- it never holds the whole
+/// file's bytes in memory across calls, matching
 /// `loaders/huggingface::SafetensorsPayloadSource`'s identical discipline.
 #[derive(Debug)]
 pub struct GgufPayloadSource {
@@ -54,7 +90,7 @@ impl ProductionArtifactPayloadSource for GgufPayloadSource {
                 identity: range.identity.clone(),
             }
         })?;
-        if range.offset != location.offset || range.length != location.length {
+        if range.offset != location.file_offset || range.length != location.declared_length {
             return Err(ProductionIngestionError::PayloadOutOfBounds {
                 identity: range.identity.clone(),
             });
@@ -66,7 +102,7 @@ impl ProductionArtifactPayloadSource for GgufPayloadSource {
         })?;
         let start = self
             .tensor_data_start
-            .checked_add(location.offset)
+            .checked_add(location.file_offset)
             .ok_or_else(|| ProductionIngestionError::PayloadOutOfBounds {
                 identity: range.identity.clone(),
             })?;
@@ -75,32 +111,51 @@ impl ProductionArtifactPayloadSource for GgufPayloadSource {
                 identity: format!("{}: {error}", range.identity),
             }
         })?;
-        let length = usize::try_from(location.length).map_err(|_| {
+        let read_length = usize::try_from(location.file_length).map_err(|_| {
             ProductionIngestionError::PayloadOutOfBounds {
                 identity: range.identity.clone(),
             }
         })?;
-        let mut buffer = vec![0u8; length];
-        file.read_exact(&mut buffer).map_err(|error| {
+        let mut raw = vec![0u8; read_length];
+        file.read_exact(&mut raw).map_err(|error| {
             ProductionIngestionError::PayloadUnavailable {
                 identity: format!("{}: {error}", range.identity),
             }
         })?;
+        // A declared digest (if any) describes the *original* file bytes,
+        // exactly like `loaders/huggingface::weight_layout`'s identical
+        // "verify before transform" discipline for its own byte
+        // transpose -- checked here, before dequantization, never against
+        // the converted representation.
         if let Some(expected_digest) = &range.digest {
-            expected_digest.verify_bytes(&buffer).map_err(|error| {
+            expected_digest.verify_bytes(&raw).map_err(|error| {
                 ProductionIngestionError::IntegrityMismatch {
                     identity: format!("{}: {error}", range.identity),
                 }
             })?;
         }
-        Ok(buffer)
+        Ok(match location.source {
+            TensorSource::Plain => raw,
+            TensorSource::Q8_0 => f32_le_bytes(&dequantize::dequantize_q8_0(&raw)),
+            TensorSource::Q4K => f32_le_bytes(&dequantize::dequantize_q4_k(&raw)),
+            TensorSource::Q5K => f32_le_bytes(&dequantize::dequantize_q5_k(&raw)),
+        })
     }
 }
 
+fn element_count(shape: &[u64]) -> Result<u64, ProductionIngestionError> {
+    shape
+        .iter()
+        .try_fold(1u64, |count, &dimension| count.checked_mul(dimension))
+        .ok_or_else(|| ProductionIngestionError::MalformedMetadata {
+            reason: "tensor element count overflowed".into(),
+        })
+}
+
 /// [`discover_and_parse_weights`]'s success value: the normalized
-/// (renamed, shape-reversed) tensor inventory, a bounded payload source,
-/// and the file's raw key-value metadata for architecture/tokenizer
-/// normalization.
+/// (renamed, shape-reversed, dequantized-where-applicable) tensor
+/// inventory, a bounded payload source, and the file's raw key-value
+/// metadata for architecture/tokenizer normalization.
 type DiscoveredGgufWeights = (
     Vec<ModelTensorMetadata>,
     GgufPayloadSource,
@@ -129,18 +184,7 @@ pub fn discover_and_parse_weights(
     let mut locations = BTreeMap::new();
     let mut tensors = Vec::with_capacity(artifact.tensors.len());
     for mut tensor in artifact.tensors {
-        if tensor.quantization.is_some() {
-            return Err(ProductionIngestionError::UnsupportedFormat {
-                reason: format!(
-                    "tensor '{}' is quantized ({:?}); GGUF quantization support is a separate, \
-                     not-yet-implemented chantier (no dequantization-at-load or quantized \
-                     compute kernels exist yet) -- only unquantized F32/F16/BF16 GGUF tensors \
-                     are supported today",
-                    tensor.name, tensor.quantization
-                ),
-            });
-        }
-        let (offset, length) = match (tensor.offset_bytes, tensor.size_bytes) {
+        let (file_offset, file_length) = match (tensor.offset_bytes, tensor.size_bytes) {
             (Some(offset), Some(length)) => (offset, length),
             _ => {
                 return Err(ProductionIngestionError::MalformedMetadata {
@@ -155,11 +199,64 @@ pub fn discover_and_parse_weights(
         // a row-major tensor is identical either way, only the shape
         // *labeling* needs reversing to match the convention every other
         // Magnetar tensor consumer (the Qwen Component, Reference CPU/
-        // CUDA kernels) expects. A 1-D tensor's reversal is a no-op.
+        // CUDA kernels) expects. A 1-D tensor's reversal is a no-op. This
+        // is a pure logical-shape relabeling, independent of quantization
+        // -- element counts are unaffected either way.
         tensor.shape.reverse();
 
+        let (source_kind, declared_length) = match tensor.storage_dtype {
+            ModelDType::Q8 | ModelDType::Q4K | ModelDType::Q5K => {
+                let elements = element_count(&tensor.shape)?;
+                let block_elements = match tensor.storage_dtype {
+                    ModelDType::Q8 => dequantize::Q8_0_BLOCK_ELEMENTS,
+                    ModelDType::Q4K | ModelDType::Q5K => dequantize::QK_BLOCK_ELEMENTS,
+                    _ => unreachable!(),
+                };
+                if !elements.is_multiple_of(block_elements) {
+                    return Err(ProductionIngestionError::MalformedMetadata {
+                        reason: format!(
+                            "tensor '{}' element count {elements} is not a multiple of its \
+                             quantization format's block size {block_elements}",
+                            tensor.name
+                        ),
+                    });
+                }
+                let dequantized_bytes = elements.checked_mul(4).ok_or_else(|| {
+                    ProductionIngestionError::MalformedMetadata {
+                        reason: format!(
+                            "tensor '{}' dequantized byte size overflowed",
+                            tensor.name
+                        ),
+                    }
+                })?;
+                let source_kind = match tensor.storage_dtype {
+                    ModelDType::Q8 => TensorSource::Q8_0,
+                    ModelDType::Q4K => TensorSource::Q4K,
+                    ModelDType::Q5K => TensorSource::Q5K,
+                    _ => unreachable!(),
+                };
+                // Fully resolved to F32 here: `weight_layout`'s transpose
+                // and every later step never learns this tensor was ever
+                // quantized.
+                tensor.storage_dtype = ModelDType::F32;
+                tensor.size_bytes = Some(dequantized_bytes);
+                tensor.quantization = None;
+                tensor.digest = None;
+                (source_kind, dequantized_bytes)
+            }
+            _ => (TensorSource::Plain, file_length),
+        };
+
         let canonical = crate::naming::normalize_tensor_name(&tensor.name)?;
-        locations.insert(canonical.clone(), TensorLocation { offset, length });
+        locations.insert(
+            canonical.clone(),
+            TensorLocation {
+                file_offset,
+                file_length,
+                declared_length,
+                source: source_kind,
+            },
+        );
         tensor.name = canonical;
         tensors.push(tensor);
     }
@@ -206,6 +303,7 @@ mod tests {
     struct TestTensor {
         name: &'static str,
         dimensions: Vec<u64>,
+        ggml_type: u32,
         data: Vec<u8>,
     }
 
@@ -232,7 +330,7 @@ mod tests {
             for dimension in &tensor.dimensions {
                 tensor_info_bytes.extend(le_u64(*dimension));
             }
-            tensor_info_bytes.extend(le_u32(0)); // ggml_type: F32
+            tensor_info_bytes.extend(le_u32(tensor.ggml_type));
             tensor_info_bytes.extend(le_u64(offset));
 
             data_section.extend(&tensor.data);
@@ -255,11 +353,13 @@ mod tests {
                 TestTensor {
                     name: "token_embd.weight",
                     dimensions: vec![4, 2], // GGUF ne order: [in, out] = [4, 2]
+                    ggml_type: 0,
                     data: vec![0u8; 4 * 2 * 4],
                 },
                 TestTensor {
                     name: "blk.0.attn_q.weight",
                     dimensions: vec![2, 2],
+                    ggml_type: 0,
                     data: {
                         let mut bytes = Vec::new();
                         for value in [1.0f32, 2.0, 3.0, 4.0] {
@@ -325,5 +425,58 @@ mod tests {
             error,
             ProductionIngestionError::RequiredPartMissing { .. }
         ));
+    }
+
+    /// GGUF `ggml_type` 8 = `Q8_0`. A quantized tensor's declared
+    /// `storage_dtype`/`size_bytes`/`quantization` must all be overridden
+    /// to reflect the *dequantized* `F32` reality, and reading it must
+    /// return the real dequantized bytes -- not the original quantized
+    /// ones, and not a rejection.
+    #[test]
+    fn dequantizes_a_q8_0_tensor_and_overrides_its_declared_dtype() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut q8_data = Vec::with_capacity(34);
+        q8_data.extend_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+        q8_data.extend((1i8..=32).map(|value| value as u8)); // qs = 1..=32
+        let file = build_gguf(
+            &[],
+            &[TestTensor {
+                name: "blk.0.attn_q.weight",
+                dimensions: vec![32], // 1-D so ne-reversal is a no-op
+                ggml_type: 8,         // GGML_TYPE_Q8_0
+                data: q8_data,
+            }],
+            32,
+        );
+        fs::write(dir.path().join(GGUF_FILE_NAME), &file).unwrap();
+
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let (tensors, payload_source, _metadata) = discover_and_parse_weights(&source).unwrap();
+        let tensor = tensors
+            .iter()
+            .find(|t| t.name == "layers.0.self_attn.q_proj")
+            .unwrap();
+        assert_eq!(tensor.storage_dtype, ModelDType::F32);
+        assert_eq!(tensor.size_bytes, Some(32 * 4));
+        assert!(tensor.quantization.is_none());
+
+        let range = ProductionPayloadRange {
+            identity: tensor.name.clone(),
+            offset: tensor.offset_bytes.unwrap(),
+            length: tensor.size_bytes.unwrap(),
+            digest: None,
+        };
+        let bytes = payload_source.read_payload(&range).unwrap();
+        let values: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        let expected: Vec<f32> = (1..=32).map(|value| value as f32).collect();
+        assert_eq!(values, expected);
     }
 }

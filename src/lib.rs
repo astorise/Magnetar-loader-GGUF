@@ -7,10 +7,16 @@
 //!
 //! Scoped to a single local `model.gguf` file declaring
 //! `general.architecture == "qwen2"` (the only architecture family a real
-//! Magnetar Model Component exists for) with unquantized `F32`/`F16`/
-//! `BF16` tensors only -- quantized GGUF tensors (`Q4_K`/`Q5_K`/`Q8_0`)
-//! are rejected structurally: dequantization-at-load or quantized compute
-//! kernels are a separate, not-yet-implemented Magnetar chantier.
+//! Magnetar Model Component exists for). Tensors quantized with GGUF's
+//! `Q8_0`/`Q4_K`/`Q5_K` block formats are dequantized to `F32` at
+//! payload-read time, *before* the projection-weight transpose runs
+//! (`resolve-gguf-quantized-projection-transpose-sequencing`) -- that
+//! transpose assumes a flat per-element byte width, meaningless for
+//! block-quantized data, so every tensor this crate hands to later steps
+//! is genuinely `F32` by the time anything else looks at it, whether or
+//! not it started out quantized. GPTQ/AWQ/BitsAndBytes (Hugging Face/
+//! Safetensors-shaped quantization schemes, unrelated to GGUF's block
+//! format) remain out of scope entirely.
 //!
 //! Parsing/normalizing a bundle never grants trust (Decision 2, matching
 //! `loaders/huggingface`): the returned
@@ -20,6 +26,7 @@
 //! Loading may materialize anything from it.
 
 mod config;
+mod dequantize;
 mod derived_lm_head;
 mod naming;
 mod tokenizer;
@@ -355,6 +362,7 @@ mod tests {
     struct TestTensor {
         name: &'static str,
         dimensions: Vec<u64>,
+        ggml_type: u32,
         data: Vec<u8>,
     }
 
@@ -379,7 +387,7 @@ mod tests {
             for dimension in &tensor.dimensions {
                 tensor_info_bytes.extend(le_u64(*dimension));
             }
-            tensor_info_bytes.extend(le_u32(0)); // F32
+            tensor_info_bytes.extend(le_u32(tensor.ggml_type));
             tensor_info_bytes.extend(le_u64(offset));
             data_section.extend(&tensor.data);
             next_offset += tensor.data.len() as u64;
@@ -442,56 +450,67 @@ mod tests {
             TestTensor {
                 name: "token_embd.weight",
                 dimensions: vec![2, 4],
+                ggml_type: 0,
                 data: f32_bytes(&token_embd),
             },
             TestTensor {
                 name: "blk.0.attn_norm.weight",
                 dimensions: vec![2],
+                ggml_type: 0,
                 data: f32_bytes(&norm),
             },
             TestTensor {
                 name: "blk.0.attn_q.weight",
                 dimensions: vec![2, 2],
+                ggml_type: 0,
                 data: f32_bytes(&square_2x2),
             },
             TestTensor {
                 name: "blk.0.attn_k.weight",
                 dimensions: vec![2, 2],
+                ggml_type: 0,
                 data: f32_bytes(&square_2x2),
             },
             TestTensor {
                 name: "blk.0.attn_v.weight",
                 dimensions: vec![2, 2],
+                ggml_type: 0,
                 data: f32_bytes(&square_2x2),
             },
             TestTensor {
                 name: "blk.0.attn_output.weight",
                 dimensions: vec![2, 2],
+                ggml_type: 0,
                 data: f32_bytes(&square_2x2),
             },
             TestTensor {
                 name: "blk.0.ffn_norm.weight",
                 dimensions: vec![2],
+                ggml_type: 0,
                 data: f32_bytes(&norm),
             },
             TestTensor {
                 name: "blk.0.ffn_gate.weight",
                 dimensions: vec![2, 4],
+                ggml_type: 0,
                 data: f32_bytes(&ffn_in2_out4),
             },
             TestTensor {
                 name: "blk.0.ffn_up.weight",
                 dimensions: vec![2, 4],
+                ggml_type: 0,
                 data: f32_bytes(&ffn_in2_out4),
             },
             TestTensor {
                 name: "blk.0.ffn_down.weight",
                 dimensions: vec![4, 2],
+                ggml_type: 0,
                 data: f32_bytes(&ffn_in4_out2),
             },
             TestTensor {
                 name: "output_norm.weight",
                 dimensions: vec![2],
+                ggml_type: 0,
                 data: f32_bytes(&norm),
             },
         ];
@@ -585,6 +604,167 @@ mod tests {
         assert_eq!(values, vec![1.0, 3.0, 5.0, 7.0, 2.0, 4.0, 6.0, 8.0]);
     }
 
+    /// The exact scenario `resolve-gguf-quantized-projection-transpose-sequencing`
+    /// exists to fix: a *quantized*, *non-square* projection weight must
+    /// be dequantized before the projection transpose runs, not after --
+    /// applying the transpose to raw quantized bytes would silently
+    /// corrupt the block structure. Dimensions here (hidden=4,
+    /// intermediate=8) are sized to hold exactly one real `Q8_0` block (32
+    /// elements) for `ffn_gate` specifically, and are deliberately
+    /// non-square so a transpose bug could not hide behind symmetry.
+    #[test]
+    fn dequantizes_then_transposes_a_non_square_quantized_projection() {
+        const HIDDEN: u64 = 4;
+        const INTERMEDIATE: u64 = 8;
+        let kvs = vec![
+            kv_string("general.architecture", "qwen2"),
+            kv_uint32("qwen2.embedding_length", HIDDEN as u32),
+            kv_uint32("qwen2.feed_forward_length", INTERMEDIATE as u32),
+            kv_uint32("qwen2.block_count", 1),
+            kv_uint32("qwen2.attention.head_count", 2),
+            kv_uint32("qwen2.attention.head_count_kv", 2),
+            kv_uint32("tokenizer.ggml.bos_token_id", 0),
+            kv_uint32("tokenizer.ggml.eos_token_id", 1),
+            kv_string("tokenizer.ggml.model", "gpt2"),
+            kv_string_array("tokenizer.ggml.tokens", &["<bos>", "<eos>", "hi", "lo"]),
+            kv_string_array("tokenizer.ggml.merges", &[]),
+        ];
+
+        let norm = vec![1.0f32; HIDDEN as usize];
+        let square = vec![1.0f32; (HIDDEN * HIDDEN) as usize];
+        let ffn_up_down = vec![1.0f32; (HIDDEN * INTERMEDIATE) as usize];
+        let token_embd = vec![1.0f32; (HIDDEN * 4) as usize];
+
+        // One real Q8_0 block: d = 1.0, qs = 1..=32 (GGUF ne=[in=4,
+        // out=8] -- 32 elements, exactly one block).
+        let mut ffn_gate_q8 = Vec::with_capacity(34);
+        ffn_gate_q8.extend_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+        ffn_gate_q8.extend((1i8..=32).map(|value| value as u8));
+
+        let tensors = [
+            TestTensor {
+                name: "token_embd.weight",
+                dimensions: vec![HIDDEN, 4],
+                ggml_type: 0,
+                data: f32_bytes(&token_embd),
+            },
+            TestTensor {
+                name: "blk.0.attn_norm.weight",
+                dimensions: vec![HIDDEN],
+                ggml_type: 0,
+                data: f32_bytes(&norm),
+            },
+            TestTensor {
+                name: "blk.0.attn_q.weight",
+                dimensions: vec![HIDDEN, HIDDEN],
+                ggml_type: 0,
+                data: f32_bytes(&square),
+            },
+            TestTensor {
+                name: "blk.0.attn_k.weight",
+                dimensions: vec![HIDDEN, HIDDEN],
+                ggml_type: 0,
+                data: f32_bytes(&square),
+            },
+            TestTensor {
+                name: "blk.0.attn_v.weight",
+                dimensions: vec![HIDDEN, HIDDEN],
+                ggml_type: 0,
+                data: f32_bytes(&square),
+            },
+            TestTensor {
+                name: "blk.0.attn_output.weight",
+                dimensions: vec![HIDDEN, HIDDEN],
+                ggml_type: 0,
+                data: f32_bytes(&square),
+            },
+            TestTensor {
+                name: "blk.0.ffn_norm.weight",
+                dimensions: vec![HIDDEN],
+                ggml_type: 0,
+                data: f32_bytes(&norm),
+            },
+            // The one quantized, non-square tensor under test.
+            TestTensor {
+                name: "blk.0.ffn_gate.weight",
+                dimensions: vec![HIDDEN, INTERMEDIATE],
+                ggml_type: 8, // GGML_TYPE_Q8_0
+                data: ffn_gate_q8,
+            },
+            TestTensor {
+                name: "blk.0.ffn_up.weight",
+                dimensions: vec![HIDDEN, INTERMEDIATE],
+                ggml_type: 0,
+                data: f32_bytes(&ffn_up_down),
+            },
+            TestTensor {
+                name: "blk.0.ffn_down.weight",
+                dimensions: vec![INTERMEDIATE, HIDDEN],
+                ggml_type: 0,
+                data: f32_bytes(&ffn_up_down),
+            },
+            TestTensor {
+                name: "output_norm.weight",
+                dimensions: vec![HIDDEN],
+                ggml_type: 0,
+                data: f32_bytes(&norm),
+            },
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(GGUF_FILE_NAME),
+            build_gguf(&kvs, &tensors, 32),
+        )
+        .unwrap();
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let result = GgufIngestor::new().ingest(&source).expect("bundle ingests");
+
+        let ffn_gate = result
+            .manifest
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == "layers.0.mlp.gate_proj")
+            .unwrap();
+        assert_eq!(
+            ffn_gate.storage_dtype,
+            magnetar_runtime::model::ModelDType::F32,
+            "a dequantized tensor's declared storage dtype must be overridden to F32"
+        );
+        assert!(ffn_gate.quantization.is_none());
+        // GGUF ne=[in=4, out=8] reversed to HF-native [out=8, in=4], then
+        // swapped back to the Component's expected [in=4, out=8].
+        assert_eq!(ffn_gate.shape, vec![HIDDEN, INTERMEDIATE]);
+
+        let range = magnetar_runtime::production_model_ingestion::ProductionPayloadRange {
+            identity: ffn_gate.name.clone(),
+            offset: ffn_gate.offset_bytes.unwrap(),
+            length: ffn_gate.size_bytes.unwrap(),
+            digest: None,
+        };
+        let bytes = result.payload_source.read_payload(&range).unwrap();
+        let values: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        // Dequantized HF-native [out=8, in=4], row-major, is [[1,2,3,4],
+        // [5,6,7,8], [9,10,11,12], [13,14,15,16], [17,18,19,20],
+        // [21,22,23,24], [25,26,27,28], [29,30,31,32]]. Transposed to
+        // [in=4, out=8]: row i = column i of the original (every 4th
+        // value starting at i).
+        let expected = vec![
+            1.0, 5.0, 9.0, 13.0, 17.0, 21.0, 25.0, 29.0, //
+            2.0, 6.0, 10.0, 14.0, 18.0, 22.0, 26.0, 30.0, //
+            3.0, 7.0, 11.0, 15.0, 19.0, 23.0, 27.0, 31.0, //
+            4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0,
+        ];
+        assert_eq!(values, expected);
+    }
+
     #[test]
     fn loads_a_real_tokenizer_from_embedded_vocabulary() {
         let dir = tempfile::tempdir().unwrap();
@@ -614,6 +794,7 @@ mod tests {
         let tensors = [TestTensor {
             name: "token_embd.weight",
             dimensions: vec![2, 4],
+            ggml_type: 0,
             data: f32_bytes(&[0.0; 8]),
         }];
         fs::write(
