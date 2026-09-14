@@ -49,7 +49,12 @@ use magnetar_runtime::production_model_ingestion::{
 };
 use std::{collections::BTreeMap, collections::BTreeSet, fs, sync::Arc};
 
-const GGUF_FILE_NAME: &str = "model.gguf";
+/// The single GGUF file name this ingestor looks for within a bundle's
+/// root -- public so a caller deciding *which* ingestor to use for a given
+/// bundle (a format-detection concern this crate itself does not own,
+/// matching `production-model-ingestion`'s registry-based dispatch model)
+/// can check for its presence without hardcoding the string itself.
+pub const GGUF_FILE_NAME: &str = "model.gguf";
 
 /// This ingestor's stable registry identity
 /// (`ProductionModelArtifactIngestor::ingestor_id`).
@@ -114,6 +119,36 @@ pub fn load_gguf_chat_template(
         Some(GgufMetadataValue::String(template)) => Some(template.clone()),
         _ => None,
     })
+}
+
+/// Re-reads and re-parses `model.gguf`'s own key-value metadata to build a
+/// real [`GgufTokenizer`] from its embedded vocabulary -- the GGUF
+/// counterpart to a caller separately reading `tokenizer.json` bytes for a
+/// Hugging Face bundle: [`ProductionIngestionResult`] never carries a
+/// tokenizer (Decision 1's "semantic output" is a manifest plus payload
+/// access, not every derived artifact), so any caller building one for a
+/// GGUF-sourced model calls this the same way it would separately
+/// construct a `HuggingFaceTokenizer` from a Hugging Face bundle's own
+/// files.
+pub fn load_gguf_tokenizer(
+    source: &ProductionModelSource,
+    artifact_id: impl Into<String>,
+    expected_vocab_size: Option<u64>,
+) -> Result<GgufTokenizer, ProductionIngestionError> {
+    let path = source.resolve(GGUF_FILE_NAME).map_err(|_| {
+        ProductionIngestionError::RequiredPartMissing {
+            part: GGUF_FILE_NAME.to_string(),
+        }
+    })?;
+    let bytes = fs::read(&path).map_err(|error| ProductionIngestionError::RequiredPartMissing {
+        part: format!("{} ({error})", path.display()),
+    })?;
+    let artifact = magnetar_format_gguf::parse(&bytes).map_err(|error| {
+        ProductionIngestionError::MalformedMetadata {
+            reason: format!("{GGUF_FILE_NAME} failed to parse as GGUF: {error}"),
+        }
+    })?;
+    GgufTokenizer::from_gguf_metadata(&artifact.metadata, artifact_id, expected_vocab_size)
 }
 
 impl ProductionModelArtifactIngestor for GgufIngestor {
@@ -561,6 +596,46 @@ mod tests {
             magnetar_runtime::model::ModelTrustStatus::Unknown
         );
         result.manifest.validate().expect("manifest validates");
+    }
+
+    /// `load_gguf_tokenizer`/`load_gguf_chat_template`
+    /// (`wire-inference-component-to-generic-registry`'s MAG-01 follow-up):
+    /// an external caller (`inference-components`) building a tokenizer/
+    /// chat formatter for a GGUF-sourced model calls these instead of
+    /// re-implementing GGUF metadata parsing itself. Verified against the
+    /// same real GGUF bytes `ingests_a_complete_tiny_gguf_file` already
+    /// exercises for ingestion, proving both functions genuinely read the
+    /// file and delegate to already-tested `GgufTokenizer::from_gguf_
+    /// metadata`, not a placeholder.
+    #[test]
+    fn load_gguf_tokenizer_and_chat_template_read_the_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(GGUF_FILE_NAME), tiny_qwen2_gguf()).unwrap();
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+
+        let tokenizer = load_gguf_tokenizer(&source, "test-tokenizer", Some(4))
+            .expect("tokenizer builds from the real embedded GGUF vocabulary");
+        assert_eq!(
+            tokenizer.metadata().vocabulary_size,
+            4,
+            "the tokenizer's real vocabulary size must match this fixture's real \
+             tokenizer.ggml.tokens array (<bos>, <eos>, hello, world), threaded through \
+             load_gguf_tokenizer unchanged"
+        );
+
+        // This fixture's own `kvs` (above) declares no
+        // `tokenizer.chat_template` key -- a real, meaningful negative
+        // case proving the function distinguishes "key absent" from
+        // "parse failed", not just that it never errors.
+        let chat_template = load_gguf_chat_template(&source)
+            .expect("chat template lookup succeeds even when the key is absent");
+        assert_eq!(
+            chat_template, None,
+            "this fixture declares no tokenizer.chat_template key"
+        );
     }
 
     #[test]
