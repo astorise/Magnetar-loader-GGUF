@@ -338,6 +338,10 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
             signatures: Vec::new(),
             source: Some(source.kind().clone()),
             architecture_config: Some(architecture_config),
+            // astorise/Magnetar#75: this ingestor's own real, known output
+            // shape -- never inferred, always stamped by the concrete
+            // ingestor that produced it.
+            artifact_format: magnetar_runtime::model::ArtifactFormat::Gguf,
         };
 
         Ok(ProductionIngestionResult {
