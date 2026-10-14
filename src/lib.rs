@@ -326,6 +326,7 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
             tokenizer_config: None,
             chat_template: chat_template_reference,
             prompt_template: None,
+            artifact_format: magnetar_runtime::model::ArtifactFormat::Gguf,
             generation: None,
             quantization: None,
             shards: Vec::new(),
