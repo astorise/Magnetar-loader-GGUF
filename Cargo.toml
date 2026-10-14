@@ -4,23 +4,19 @@
 name = "magnetar-loader-gguf"
 version = "0.1.0"
 edition = "2024"
-# Never published to crates.io independently -- this crate is only
-# buildable from within a checkout of the parent Magnetar repository,
-# matching every other externalized module's own Cargo.toml
-# (`loaders/huggingface`, `providers/cpu`, `formats/safetensors`, ...).
-publish = false
+license = "MIT"
+description = "GGUF production model loader for the Magnetar inference runtime."
+repository = "https://github.com/astorise/Magnetar-loader-GGUF"
+readme = "README.md"
+keywords = ["ai", "inference", "magnetar"]
+categories = ["science"]
+rust-version = "1.98"
 
 [dependencies]
-# Path dependencies, not published crates: this crate is only buildable
-# from within a checkout of the parent Magnetar repository, with this
-# submodule checked out at `loaders/gguf` (matching CI's `submodules:
-# recursive` checkout and the same pattern every other externalized
-# module uses). `magnetar-runtime` supplies the generic production-model-
-# ingestion contract this crate implements; `magnetar-format-gguf`
-# supplies the real GGUF container parser this crate composes rather than
-# reimplementing.
-magnetar-runtime = { path = "../../magnetar-runtime" }
-magnetar-format-gguf = { path = "../../formats/gguf" }
+# `path` resolves inside a checkout of the parent Magnetar repository;
+# `version` is what `cargo publish` records for crates.io consumers.
+magnetar-runtime = { version = "0.1.0", path = "../../magnetar-runtime" }
+magnetar-format-gguf = { version = "0.1.0", path = "../../formats/gguf" }
 # Real GGUF-embedded-vocabulary tokenizer construction (byte-level BPE,
 # matching Qwen2's real tokenizer shape): built programmatically from the
 # GGUF file's own `tokenizer.ggml.tokens`/`merges` arrays via `tokenizers`'
