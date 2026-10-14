@@ -28,7 +28,7 @@ magnetar-format-gguf = { path = "../../formats/gguf" }
 # (GGUF embeds the vocabulary directly, unlike a Hugging Face bundle).
 # Kept out of `magnetar-runtime` entirely, matching `loaders/huggingface`'s
 # own use of this crate.
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 
 [dev-dependencies]
 tempfile = "3"
