@@ -167,7 +167,7 @@ impl GgufTokenizer {
                 })
                 .collect();
             if !special_tokens.is_empty() {
-                inner.add_special_tokens(&special_tokens);
+                inner.add_special_tokens(special_tokens);
             }
         }
 
