@@ -8,13 +8,10 @@
 //! Scoped to a single local `model.gguf` file declaring
 //! `general.architecture == "qwen2"` (the only architecture family a real
 //! Magnetar Model Component exists for). Tensors quantized with GGUF's
-//! `Q8_0`/`Q4_K`/`Q5_K` block formats are dequantized to `F32` at
-//! payload-read time, *before* the projection-weight transpose runs
-//! (`resolve-gguf-quantized-projection-transpose-sequencing`) -- that
-//! transpose assumes a flat per-element byte width, meaningless for
-//! block-quantized data, so every tensor this crate hands to later steps
-//! is genuinely `F32` by the time anything else looks at it, whether or
-//! not it started out quantized. GPTQ/AWQ/BitsAndBytes (Hugging Face/
+//! `Q8_0`/`Q4_K`/`Q5_K` block formats keep their original bytes and
+//! storage dtype; quantized projections declare transposed storage instead
+//! of being transposed byte by byte (`execute-direct-quantized-weights`),
+//! and Model Loading converts or hands them over packed. GPTQ/AWQ/BitsAndBytes (Hugging Face/
 //! Safetensors-shaped quantization schemes, unrelated to GGUF's block
 //! format) remain out of scope entirely.
 //!
@@ -26,9 +23,9 @@
 //! Loading may materialize anything from it.
 
 mod config;
-mod dequantize;
 mod derived_lm_head;
 mod naming;
+mod quant_blocks;
 mod tokenizer;
 mod weight_layout;
 mod weights;
@@ -680,16 +677,17 @@ mod tests {
         assert_eq!(values, vec![1.0, 3.0, 5.0, 7.0, 2.0, 4.0, 6.0, 8.0]);
     }
 
-    /// The exact scenario `resolve-gguf-quantized-projection-transpose-sequencing`
-    /// exists to fix: a *quantized*, *non-square* projection weight must
-    /// be dequantized before the projection transpose runs, not after --
-    /// applying the transpose to raw quantized bytes would silently
-    /// corrupt the block structure. Dimensions here (hidden=4,
-    /// intermediate=8) are sized to hold exactly one real `Q8_0` block (32
-    /// elements) for `ffn_gate` specifically, and are deliberately
+    /// A *quantized*, *non-square* projection weight is never transposed
+    /// byte by byte (that would corrupt its block structure,
+    /// `resolve-gguf-quantized-projection-transpose-sequencing`): it keeps
+    /// its packed bytes and declares transposed storage
+    /// (`execute-direct-quantized-weights`), and Model Loading's own
+    /// conversion yields the same transposed matrix the byte transpose used
+    /// to. Dimensions here (hidden=4, intermediate=8) hold exactly one real
+    /// `Q8_0` block (32 elements) for `ffn_gate` and are deliberately
     /// non-square so a transpose bug could not hide behind symmetry.
     #[test]
-    fn dequantizes_then_transposes_a_non_square_quantized_projection() {
+    fn keeps_a_non_square_quantized_projection_packed_and_declares_it_transposed() {
         const HIDDEN: u64 = 4;
         const INTERMEDIATE: u64 = 8;
         let kvs = vec![
@@ -806,27 +804,23 @@ mod tests {
             .unwrap();
         assert_eq!(
             ffn_gate.storage_dtype,
-            magnetar_runtime::model::ModelDType::F32,
-            "a dequantized tensor's declared storage dtype must be overridden to F32"
+            magnetar_runtime::model::ModelDType::Q8,
+            "a quantized tensor keeps its storage dtype"
         );
-        assert!(ffn_gate.quantization.is_none());
+        assert_eq!(
+            ffn_gate.layout.as_deref(),
+            Some(magnetar_runtime::packed_weight::TRANSPOSED_STORAGE_LAYOUT)
+        );
         // GGUF ne=[in=4, out=8] reversed to HF-native [out=8, in=4], then
         // swapped back to the Component's expected [in=4, out=8].
         assert_eq!(ffn_gate.shape, vec![HIDDEN, INTERMEDIATE]);
 
-        let range = magnetar_runtime::production_model_ingestion::ProductionPayloadRange {
-            identity: ffn_gate.name.clone(),
-            offset: ffn_gate.offset_bytes.unwrap(),
-            length: ffn_gate.size_bytes.unwrap(),
-            digest: None,
-        };
-        let bytes = result.payload_source.read_payload(&range).unwrap();
-        let values: Vec<f32> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|chunk| f32::from_le_bytes(*chunk))
-            .collect();
+        let values = magnetar_runtime::model_loading::host_tensor_from_payload_source(
+            ffn_gate,
+            result.payload_source.as_ref(),
+        )
+        .expect("Model Loading converts the packed, transposed-storage tensor")
+        .data;
         // Dequantized HF-native [out=8, in=4], row-major, is [[1,2,3,4],
         // [5,6,7,8], [9,10,11,12], [13,14,15,16], [17,18,19,20],
         // [21,22,23,24], [25,26,27,28], [29,30,31,32]]. Transposed to

@@ -5,22 +5,15 @@
 //! Hugging Face's separate/sharded Safetensors files, so there is no
 //! shard discovery step here -- only one file to resolve and parse.
 //!
-//! A quantized tensor (`Q8_0`/`Q4_K`/`Q5_K`) is dequantized to `F32` right
-//! here, at payload-read time, *before* `weight_layout.rs`'s projection
-//! transpose ever sees it (`resolve-gguf-quantized-projection-transpose-sequencing`):
-//! that transpose assumes a flat per-element byte width, which is
-//! meaningless for block-quantized data, so dequantizing first and
-//! presenting the result as plain `F32` (overriding the discovered
-//! tensor's declared `storage_dtype`/`size_bytes`/`quantization`
-//! accordingly) means every later step in this crate's pipeline treats a
-//! formerly-quantized tensor exactly like a real `F32` one, with no
-//! special-casing needed downstream. `magnetar-runtime`'s own generic
-//! `Q8_0`/`Q4_K`/`Q5_K` dequantization
-//! (`support-gguf-quantized-tensor-dequantization`) is consequently never
-//! reached for a GGUF-sourced tensor -- this crate fully resolves to `F32`
-//! before Model Loading ever sees it.
+//! A block-quantized tensor (`Q8_0`/`Q4_K`/`Q5_K`) keeps its storage dtype
+//! and original bytes (`execute-direct-quantized-weights`): Model Loading
+//! either hands a `Q8_0` matrix to the Provider packed or dequantizes it
+//! with `magnetar-runtime`'s own implementation. A quantized projection is
+//! never transposed byte by byte (meaningless for block-quantized data,
+//! `resolve-gguf-quantized-projection-transpose-sequencing`); it declares
+//! transposed storage instead (`weight_layout.rs`).
 
-use crate::dequantize;
+use crate::quant_blocks;
 use magnetar_runtime::model::{ModelDType, ModelTensorMetadata};
 use magnetar_runtime::production_model_ingestion::{
     ProductionArtifactPayloadSource, ProductionIngestionError, ProductionModelSource,
@@ -35,42 +28,21 @@ use std::{
 
 const GGUF_FILE_NAME: &str = "model.gguf";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TensorSource {
-    Plain,
-    Q8_0,
-    Q4K,
-    Q5K,
-}
-
-/// One tensor's location in the original GGUF file, and how to turn its
-/// raw bytes into what Model Loading actually requests. `file_offset`/
-/// `file_length` describe the *original* bytes as declared by
-/// `magnetar-format-gguf` (quantized or not); `declared_length` is what a
-/// caller's `ProductionPayloadRange.length` must equal -- the same as
-/// `file_length` for [`TensorSource::Plain`], or the dequantized `F32`
-/// byte count otherwise (matching the overridden `size_bytes` this
-/// crate's [`discover_and_parse_weights`] puts on the returned
-/// `ModelTensorMetadata`).
+/// One tensor's location in the original GGUF file, as declared by
+/// `magnetar-format-gguf`. Every tensor, block-quantized or not, is served
+/// as its original bytes: Model Loading converts them (or hands a
+/// block-quantized matrix to the Provider packed,
+/// `execute-direct-quantized-weights`).
 #[derive(Debug)]
 struct TensorLocation {
     file_offset: u64,
     file_length: u64,
-    declared_length: u64,
-    source: TensorSource,
-}
-
-fn f32_le_bytes(values: &[f32]) -> Vec<u8> {
-    values
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect()
 }
 
 /// Bounded, on-demand [`ProductionArtifactPayloadSource`] for a GGUF file:
 /// `read_payload` opens the file, seeks to `tensor_data_start + offset`,
-/// reads exactly the *original* bytes, and (for a quantized tensor)
-/// dequantizes them to `F32` before returning -- it never holds the whole
+/// reads exactly the *original* bytes, block-quantized or not, and returns
+/// them unconverted -- it never holds the whole
 /// file's bytes in memory across calls, matching
 /// `loaders/huggingface::SafetensorsPayloadSource`'s identical discipline.
 #[derive(Debug)]
@@ -90,7 +62,7 @@ impl ProductionArtifactPayloadSource for GgufPayloadSource {
                 identity: range.identity.clone(),
             }
         })?;
-        if range.offset != location.file_offset || range.length != location.declared_length {
+        if range.offset != location.file_offset || range.length != location.file_length {
             return Err(ProductionIngestionError::PayloadOutOfBounds {
                 identity: range.identity.clone(),
             });
@@ -122,11 +94,8 @@ impl ProductionArtifactPayloadSource for GgufPayloadSource {
                 identity: format!("{}: {error}", range.identity),
             }
         })?;
-        // A declared digest (if any) describes the *original* file bytes,
-        // exactly like `loaders/huggingface::weight_layout`'s identical
-        // "verify before transform" discipline for its own byte
-        // transpose -- checked here, before dequantization, never against
-        // the converted representation.
+        // A declared digest (if any) describes the original file bytes,
+        // which are exactly what is returned.
         if let Some(expected_digest) = &range.digest {
             expected_digest.verify_bytes(&raw).map_err(|error| {
                 ProductionIngestionError::IntegrityMismatch {
@@ -134,12 +103,7 @@ impl ProductionArtifactPayloadSource for GgufPayloadSource {
                 }
             })?;
         }
-        Ok(match location.source {
-            TensorSource::Plain => raw,
-            TensorSource::Q8_0 => f32_le_bytes(&dequantize::dequantize_q8_0(&raw)),
-            TensorSource::Q4K => f32_le_bytes(&dequantize::dequantize_q4_k(&raw)),
-            TensorSource::Q5K => f32_le_bytes(&dequantize::dequantize_q5_k(&raw)),
-        })
+        Ok(raw)
     }
 }
 
@@ -204,48 +168,25 @@ pub fn discover_and_parse_weights(
         // -- element counts are unaffected either way.
         tensor.shape.reverse();
 
-        let (source_kind, declared_length) = match tensor.storage_dtype {
-            ModelDType::Q8 | ModelDType::Q4K | ModelDType::Q5K => {
-                let elements = element_count(&tensor.shape)?;
-                let block_elements = match tensor.storage_dtype {
-                    ModelDType::Q8 => dequantize::Q8_0_BLOCK_ELEMENTS,
-                    ModelDType::Q4K | ModelDType::Q5K => dequantize::QK_BLOCK_ELEMENTS,
-                    _ => unreachable!(),
-                };
-                if !elements.is_multiple_of(block_elements) {
-                    return Err(ProductionIngestionError::MalformedMetadata {
-                        reason: format!(
-                            "tensor '{}' element count {elements} is not a multiple of its \
-                             quantization format's block size {block_elements}",
-                            tensor.name
-                        ),
-                    });
-                }
-                let dequantized_bytes = elements.checked_mul(4).ok_or_else(|| {
-                    ProductionIngestionError::MalformedMetadata {
-                        reason: format!(
-                            "tensor '{}' dequantized byte size overflowed",
-                            tensor.name
-                        ),
-                    }
-                })?;
-                let source_kind = match tensor.storage_dtype {
-                    ModelDType::Q8 => TensorSource::Q8_0,
-                    ModelDType::Q4K => TensorSource::Q4K,
-                    ModelDType::Q5K => TensorSource::Q5K,
-                    _ => unreachable!(),
-                };
-                // Fully resolved to F32 here: `weight_layout`'s transpose
-                // and every later step never learns this tensor was ever
-                // quantized.
-                tensor.storage_dtype = ModelDType::F32;
-                tensor.size_bytes = Some(dequantized_bytes);
-                tensor.quantization = None;
-                tensor.digest = None;
-                (source_kind, dequantized_bytes)
+        // A block-quantized tensor keeps its storage dtype and original
+        // bytes (`execute-direct-quantized-weights`); its element count
+        // must still be a whole number of its format's blocks.
+        if let Some(block_elements) = match tensor.storage_dtype {
+            ModelDType::Q8 => Some(quant_blocks::Q8_0_BLOCK_ELEMENTS),
+            ModelDType::Q4K | ModelDType::Q5K => Some(quant_blocks::QK_BLOCK_ELEMENTS),
+            _ => None,
+        } {
+            let elements = element_count(&tensor.shape)?;
+            if !elements.is_multiple_of(block_elements) {
+                return Err(ProductionIngestionError::MalformedMetadata {
+                    reason: format!(
+                        "tensor '{}' element count {elements} is not a multiple of its \
+                         quantization format's block size {block_elements}",
+                        tensor.name
+                    ),
+                });
             }
-            _ => (TensorSource::Plain, file_length),
-        };
+        }
 
         let canonical = crate::naming::normalize_tensor_name(&tensor.name)?;
         locations.insert(
@@ -253,8 +194,6 @@ pub fn discover_and_parse_weights(
             TensorLocation {
                 file_offset,
                 file_length,
-                declared_length,
-                source: source_kind,
             },
         );
         tensor.name = canonical;
@@ -427,17 +366,17 @@ mod tests {
         ));
     }
 
-    /// GGUF `ggml_type` 8 = `Q8_0`. A quantized tensor's declared
-    /// `storage_dtype`/`size_bytes`/`quantization` must all be overridden
-    /// to reflect the *dequantized* `F32` reality, and reading it must
-    /// return the real dequantized bytes -- not the original quantized
-    /// ones, and not a rejection.
+    /// GGUF `ggml_type` 8 = `Q8_0`. A quantized tensor keeps its declared
+    /// storage dtype and size, and reading it returns its original packed
+    /// bytes (`execute-direct-quantized-weights`): Model Loading, not this
+    /// ingestor, decides whether they are dequantized.
     #[test]
-    fn dequantizes_a_q8_0_tensor_and_overrides_its_declared_dtype() {
+    fn keeps_a_q8_0_tensor_packed() {
         let dir = tempfile::tempdir().unwrap();
         let mut q8_data = Vec::with_capacity(34);
         q8_data.extend_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
         q8_data.extend((1i8..=32).map(|value| value as u8)); // qs = 1..=32
+        let packed = q8_data.clone();
         let file = build_gguf(
             &[],
             &[TestTensor {
@@ -459,9 +398,8 @@ mod tests {
             .iter()
             .find(|t| t.name == "layers.0.self_attn.q_proj")
             .unwrap();
-        assert_eq!(tensor.storage_dtype, ModelDType::F32);
-        assert_eq!(tensor.size_bytes, Some(32 * 4));
-        assert!(tensor.quantization.is_none());
+        assert_eq!(tensor.storage_dtype, ModelDType::Q8);
+        assert_eq!(tensor.size_bytes, Some(34));
 
         let range = ProductionPayloadRange {
             identity: tensor.name.clone(),
@@ -469,14 +407,6 @@ mod tests {
             length: tensor.size_bytes.unwrap(),
             digest: None,
         };
-        let bytes = payload_source.read_payload(&range).unwrap();
-        let values: Vec<f32> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|chunk| f32::from_le_bytes(*chunk))
-            .collect();
-        let expected: Vec<f32> = (1..=32).map(|value| value as f32).collect();
-        assert_eq!(values, expected);
+        assert_eq!(payload_source.read_payload(&range).unwrap(), packed);
     }
 }
