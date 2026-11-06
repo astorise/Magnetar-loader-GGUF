@@ -167,6 +167,9 @@ pub fn normalize(
         rope_theta,
         rope_scaling_factor: float_value(metadata, "qwen2.rope.scaling.factor")
             .map(|value| value as f32),
+        // This loader reads `qwen2.*` metadata only, which declares no
+        // per-frequency RoPE scaling.
+        rope_frequency_scaling: None,
         // Patched to real tensor-derived evidence by the caller; see this
         // function's own doc comment.
         tie_word_embeddings: false,
