@@ -313,7 +313,15 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
         let manifest = ModelManifest {
             schema_version: magnetar_runtime::model::MODEL_ARTIFACT_SCHEMA_VERSION,
             id,
-            architecture: ModelArchitecture::new("qwen", config::SUPPORTED_ARCHITECTURE),
+            // The family is the checkpoint's own architecture name
+            // (`general.architecture`), as `loaders/huggingface` uses its
+            // `model_type`: one architecture names one family whichever
+            // format it came in, so the Model Component that declares it
+            // serves both.
+            architecture: ModelArchitecture::new(
+                config::SUPPORTED_ARCHITECTURE,
+                config::SUPPORTED_ARCHITECTURE,
+            ),
             parts,
             storage_dtype,
             compute_dtype: None,
@@ -561,6 +569,9 @@ mod tests {
         let result = GgufIngestor::new().ingest(&source).expect("bundle ingests");
 
         assert!(result.manifest.architecture_config.is_some());
+        // The family is the checkpoint's own architecture name, as for a
+        // Hugging Face bundle's model_type.
+        assert_eq!(result.manifest.architecture.family, "qwen2");
         let config = result.manifest.architecture_config.clone().unwrap();
         assert_eq!(config.hidden_size, 2);
         assert_eq!(config.intermediate_size, 4);
