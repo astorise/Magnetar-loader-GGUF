@@ -91,6 +91,17 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
             "ffn_gate" => "mlp.gate_proj",
             "ffn_up" => "mlp.up_proj",
             "ffn_down" => "mlp.down_proj",
+            // `execute-and-cache-moe-experts` F02 (llama.cpp's `qwen2moe`):
+            // the router, the stacked routed experts, and the shared expert
+            // with its scalar gate.
+            "ffn_gate_inp" => "moe.router_proj",
+            "ffn_gate_exps" => "moe.experts_gate_proj",
+            "ffn_up_exps" => "moe.experts_up_proj",
+            "ffn_down_exps" => "moe.experts_down_proj",
+            "ffn_gate_shexp" => "moe.shared_gate_proj",
+            "ffn_up_shexp" => "moe.shared_up_proj",
+            "ffn_down_shexp" => "moe.shared_down_proj",
+            "ffn_gate_inp_shexp" => "moe.shared_expert_gate",
             other => {
                 return Err(ProductionIngestionError::MalformedMetadata {
                     reason: format!(
@@ -144,6 +155,37 @@ mod tests {
             normalize_tensor_name("blk.3.ffn_norm.weight").unwrap(),
             "layers.3.post_attn_norm"
         );
+    }
+
+    #[test]
+    fn normalizes_mixture_of_experts_tensors() {
+        for (raw, canonical) in [
+            ("blk.2.ffn_gate_inp.weight", "layers.2.moe.router_proj"),
+            (
+                "blk.2.ffn_gate_exps.weight",
+                "layers.2.moe.experts_gate_proj",
+            ),
+            ("blk.2.ffn_up_exps.weight", "layers.2.moe.experts_up_proj"),
+            (
+                "blk.2.ffn_down_exps.weight",
+                "layers.2.moe.experts_down_proj",
+            ),
+            (
+                "blk.2.ffn_gate_shexp.weight",
+                "layers.2.moe.shared_gate_proj",
+            ),
+            ("blk.2.ffn_up_shexp.weight", "layers.2.moe.shared_up_proj"),
+            (
+                "blk.2.ffn_down_shexp.weight",
+                "layers.2.moe.shared_down_proj",
+            ),
+            (
+                "blk.2.ffn_gate_inp_shexp.weight",
+                "layers.2.moe.shared_expert_gate",
+            ),
+        ] {
+            assert_eq!(normalize_tensor_name(raw).unwrap(), canonical);
+        }
     }
 
     #[test]

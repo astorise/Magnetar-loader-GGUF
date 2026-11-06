@@ -245,6 +245,26 @@ pub fn discover_and_parse_weights(
         }
 
         let canonical = crate::naming::normalize_tensor_name(&tensor.name)?;
+        // A stacked expert tensor, `[experts, out, in]` row-major, is the
+        // 2D matrix `[experts * out, in]` over the same bytes: expert `e`
+        // owns rows `[e*out, (e+1)*out)`, which the projection transpose
+        // turns into columns (`execute-and-cache-moe-experts`).
+        if canonical.contains(".moe.experts_") {
+            let [experts, out, inner] = tensor.shape[..] else {
+                return Err(ProductionIngestionError::MalformedMetadata {
+                    reason: format!(
+                        "stacked expert tensor '{}' is not 3D: {:?}",
+                        tensor.name, tensor.shape
+                    ),
+                });
+            };
+            tensor.shape = vec![experts * out, inner];
+        }
+        // The shared expert's scalar gate is a `[hidden]` vector: the
+        // `[hidden, 1]` matrix it multiplies by, over the same bytes.
+        if canonical.ends_with(".moe.shared_expert_gate") && tensor.shape.len() == 1 {
+            tensor.shape.push(1);
+        }
         locations.insert(
             canonical.clone(),
             TensorLocation {

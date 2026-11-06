@@ -17,11 +17,12 @@ use magnetar_runtime::model::ModelArchitectureConfig;
 use magnetar_runtime::production_model_ingestion::ProductionIngestionError;
 use std::collections::BTreeMap;
 
-/// The `general.architecture` values this loader reads. Both share one
+/// The `general.architecture` values this loader reads. They share one
 /// decoder-block key schema (`<arch>.*`); they differ in how llama.cpp's
 /// converter stores the attention projections (see
-/// [`rope_rows_interleaved`]).
-pub const SUPPORTED_ARCHITECTURES: [&str; 2] = ["qwen2", "llama"];
+/// [`rope_rows_interleaved`]) and, for `qwen2moe`, in a routed
+/// mixture-of-experts MLP ([`mixture_of_experts`]).
+pub const SUPPORTED_ARCHITECTURES: [&str; 3] = ["qwen2", "llama", "qwen2moe"];
 
 /// Whether llama.cpp's converter permuted `architecture`'s query and key
 /// projection rows for its interleaved-pair RoPE: it does for `llama`
@@ -75,6 +76,49 @@ fn required_uint(
 ) -> Result<u64, ProductionIngestionError> {
     uint_value(metadata, key)
         .ok_or_else(|| malformed(format!("GGUF metadata is missing required key '{key}'")))
+}
+
+/// The routed mixture of experts a `qwen2moe` file declares, from its
+/// `<arch>.expert_count`/`expert_used_count` metadata and the stored
+/// shapes of layer 0's stacked experts (`[experts * intermediate,
+/// hidden]`) and shared expert (`[shared, hidden]`); `None` for a dense
+/// architecture. llama.cpp's `qwen2moe` never renormalizes the chosen
+/// experts' probabilities (Hugging Face `norm_topk_prob = false`).
+pub fn mixture_of_experts(
+    metadata: &BTreeMap<String, GgufMetadataValue>,
+    architecture: &str,
+    stored_shape: impl Fn(&str) -> Option<Vec<u64>>,
+) -> Result<Option<magnetar_runtime::model::MixtureOfExpertsConfig>, ProductionIngestionError> {
+    if architecture != "qwen2moe" {
+        return Ok(None);
+    }
+    let key = |name: &str| format!("{architecture}.{name}");
+    let count = |name: &str| -> Result<u32, ProductionIngestionError> {
+        u32::try_from(required_uint(metadata, &key(name))?)
+            .map_err(|_| malformed(format!("GGUF metadata's {name} does not fit in a u32")))
+    };
+    let experts = count("expert_count")?;
+    let experts_per_token = count("expert_used_count")?;
+    let rows = |name: &str| {
+        stored_shape(name)
+            .and_then(|shape| shape.first().copied())
+            .ok_or_else(|| malformed(format!("a mixture-of-experts file has no '{name}' tensor")))
+    };
+    let stacked = rows("layers.0.moe.experts_gate_proj")?;
+    if experts == 0 || !stacked.is_multiple_of(u64::from(experts)) {
+        return Err(malformed(format!(
+            "{stacked} stacked expert rows are not {experts} equal experts"
+        )));
+    }
+    let shared_expert_intermediate_size =
+        stored_shape("layers.0.moe.shared_gate_proj").and_then(|shape| shape.first().copied());
+    Ok(Some(magnetar_runtime::model::MixtureOfExpertsConfig {
+        experts,
+        experts_per_token,
+        expert_intermediate_size: stacked / u64::from(experts),
+        shared_expert_intermediate_size,
+        normalize_top_k: false,
+    }))
 }
 
 /// `general.architecture`, when it is one this loader reads.
@@ -192,6 +236,7 @@ pub fn normalize(
         // function's own doc comment.
         tie_word_embeddings: false,
         attention_bias: false,
+        mixture_of_experts: None,
         bos_token_id: uint_value(metadata, "tokenizer.ggml.bos_token_id")
             .and_then(|value| u32::try_from(value).ok()),
         eos_token_id: uint_value(metadata, "tokenizer.ggml.eos_token_id")

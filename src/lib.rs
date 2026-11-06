@@ -169,6 +169,18 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
         architecture_config.attention_bias = tensors
             .iter()
             .any(|tensor| tensor.name.ends_with("self_attn.q_bias"));
+        architecture_config.mixture_of_experts =
+            config::mixture_of_experts(&metadata, architecture, |name| {
+                tensors
+                    .iter()
+                    .find(|tensor| tensor.name == name)
+                    .map(|tensor| tensor.shape.clone())
+            })?;
+        architecture_config.validate().map_err(|error| {
+            ProductionIngestionError::MalformedMetadata {
+                reason: format!("GGUF mixture of experts is inconsistent: {error}"),
+            }
+        })?;
         let tie_word_embeddings = !tensors.iter().any(|tensor| tensor.name == "lm_head");
         architecture_config.tie_word_embeddings = tie_word_embeddings;
 
