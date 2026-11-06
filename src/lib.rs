@@ -26,11 +26,12 @@ mod config;
 mod derived_lm_head;
 mod naming;
 mod quant_blocks;
+mod rope_rows;
 mod tokenizer;
 mod weight_layout;
 mod weights;
 
-pub use config::SUPPORTED_ARCHITECTURE;
+pub use config::SUPPORTED_ARCHITECTURES;
 pub use naming::normalize_tensor_name;
 pub use tokenizer::GgufTokenizer;
 pub use weights::GgufPayloadSource;
@@ -104,14 +105,7 @@ pub fn load_gguf_chat_template(
             part: GGUF_FILE_NAME.to_string(),
         }
     })?;
-    let bytes = fs::read(&path).map_err(|error| ProductionIngestionError::RequiredPartMissing {
-        part: format!("{} ({error})", path.display()),
-    })?;
-    let artifact = magnetar_format_gguf::parse(&bytes).map_err(|error| {
-        ProductionIngestionError::MalformedMetadata {
-            reason: format!("{GGUF_FILE_NAME} failed to parse as GGUF: {error}"),
-        }
-    })?;
+    let artifact = weights::parse_header(&path)?;
     Ok(match artifact.metadata.get("tokenizer.chat_template") {
         Some(GgufMetadataValue::String(template)) => Some(template.clone()),
         _ => None,
@@ -137,14 +131,7 @@ pub fn load_gguf_tokenizer(
             part: GGUF_FILE_NAME.to_string(),
         }
     })?;
-    let bytes = fs::read(&path).map_err(|error| ProductionIngestionError::RequiredPartMissing {
-        part: format!("{} ({error})", path.display()),
-    })?;
-    let artifact = magnetar_format_gguf::parse(&bytes).map_err(|error| {
-        ProductionIngestionError::MalformedMetadata {
-            reason: format!("{GGUF_FILE_NAME} failed to parse as GGUF: {error}"),
-        }
-    })?;
+    let artifact = weights::parse_header(&path)?;
     GgufTokenizer::from_gguf_metadata(&artifact.metadata, artifact_id, expected_vocab_size)
 }
 
@@ -171,6 +158,7 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
             .ok_or_else(|| ProductionIngestionError::MalformedMetadata {
                 reason: "no token_embedding tensor was discovered".into(),
             })?;
+        let architecture = config::architecture(&metadata)?;
         let mut architecture_config = config::normalize(&metadata, vocab_size)?;
 
         // Neither real evidence GGUF's key-value metadata reliably
@@ -192,6 +180,12 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
         // change's design.md for the sourced research) -- the Component
         // expects `[in_features, out_features]` instead; see
         // `weight_layout.rs`.
+        let payload_source = rope_rows::RopeRowRestoringPayloadSource::new(
+            payload_source,
+            &mut tensors,
+            config::rope_rows_interleaved(architecture),
+            architecture_config.head_dim,
+        )?;
         let transposing_source =
             weight_layout::TransposingPayloadSource::new(payload_source, &tensors);
         weight_layout::swap_declared_projection_shapes(&mut tensors);
@@ -233,12 +227,13 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
         // itself, honestly representing "this manifest is anchored to
         // this exact file's real bytes" without fabricating a fake
         // separate digest for a part boundary GGUF does not have.
-        let file_bytes = fs::read(source.resolve(GGUF_FILE_NAME)?).map_err(|error| {
-            ProductionIngestionError::RequiredPartMissing {
+        let file_path = source.resolve(GGUF_FILE_NAME)?;
+        let file_length = fs::metadata(&file_path)
+            .map_err(|error| ProductionIngestionError::RequiredPartMissing {
                 part: format!("{GGUF_FILE_NAME} ({error})"),
-            }
-        })?;
-        let file_digest = ModelDigest::sha256(&file_bytes);
+            })?
+            .len();
+        let file_digest = weights::file_digest(&file_path)?;
 
         let mut parts = BTreeMap::new();
         parts.insert(
@@ -247,7 +242,7 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
                 name: "gguf_metadata".to_string(),
                 kind: ModelArtifactKind::ModelConfig,
                 digest: file_digest.clone(),
-                size_bytes: Some(file_bytes.len() as u64),
+                size_bytes: Some(file_length),
                 required: true,
             },
         );
@@ -294,7 +289,7 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
 
         let model_display_name = match metadata.get("general.name") {
             Some(GgufMetadataValue::String(name)) => name.as_str(),
-            _ => config::SUPPORTED_ARCHITECTURE,
+            _ => architecture,
         };
         let name = sanitize_model_name(model_display_name);
         let id = ModelArtifactId::new(
@@ -318,10 +313,7 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
             // `model_type`: one architecture names one family whichever
             // format it came in, so the Model Component that declares it
             // serves both.
-            architecture: ModelArchitecture::new(
-                config::SUPPORTED_ARCHITECTURE,
-                config::SUPPORTED_ARCHITECTURE,
-            ),
+            architecture: ModelArchitecture::new(architecture, architecture),
             parts,
             storage_dtype,
             compute_dtype: None,
@@ -869,9 +861,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_non_qwen2_architecture_end_to_end() {
+    fn rejects_an_unsupported_architecture_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
-        let kvs = vec![kv_string("general.architecture", "llama")];
+        let kvs = vec![kv_string("general.architecture", "gemma3")];
         let tensors = [TestTensor {
             name: "token_embd.weight",
             dimensions: vec![2, 4],

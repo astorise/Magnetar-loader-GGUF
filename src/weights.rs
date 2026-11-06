@@ -126,6 +126,70 @@ type DiscoveredGgufWeights = (
     BTreeMap<String, magnetar_format_gguf::GgufMetadataValue>,
 );
 
+/// The first header read, grown until the whole header fits: a checkpoint
+/// of several gigabytes is never read whole to learn its layout.
+const INITIAL_HEADER_READ: u64 = 16 << 20;
+
+/// Parses `path`'s GGUF header from a prefix of the file.
+pub(crate) fn parse_header(
+    path: &std::path::Path,
+) -> Result<magnetar_format_gguf::GgufArtifact, ProductionIngestionError> {
+    let unavailable = |error: std::io::Error| ProductionIngestionError::RequiredPartMissing {
+        part: format!("{} ({error})", path.display()),
+    };
+    let mut file = fs::File::open(path).map_err(unavailable)?;
+    let file_length = file.metadata().map_err(unavailable)?.len();
+    let mut prefix = Vec::new();
+    let mut want = INITIAL_HEADER_READ.min(file_length);
+    loop {
+        let have = prefix.len() as u64;
+        (&mut file)
+            .take(want - have)
+            .read_to_end(&mut prefix)
+            .map_err(unavailable)?;
+        match magnetar_format_gguf::parse_prefix(&prefix, file_length) {
+            Err(magnetar_format_gguf::GgufError::UnexpectedEof { .. }) if want < file_length => {
+                want = want.saturating_mul(2).min(file_length);
+            }
+            parsed => {
+                return parsed.map_err(|error| ProductionIngestionError::MalformedMetadata {
+                    reason: format!("{GGUF_FILE_NAME} failed to parse as GGUF: {error}"),
+                });
+            }
+        }
+    }
+}
+
+/// The sha256 content digest of the file at `path`, streamed.
+pub(crate) fn file_digest(
+    path: &std::path::Path,
+) -> Result<magnetar_runtime::ModelDigest, ProductionIngestionError> {
+    use sha2::{Digest, Sha256};
+    let unavailable = |error: std::io::Error| ProductionIngestionError::RequiredPartMissing {
+        part: format!("{} ({error})", path.display()),
+    };
+    let mut file = fs::File::open(path).map_err(unavailable)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 8 << 20];
+    loop {
+        let read = file.read(&mut buffer).map_err(unavailable)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    magnetar_runtime::ModelDigest::parse(format!("sha256:{hex}")).map_err(|error| {
+        ProductionIngestionError::MalformedMetadata {
+            reason: error.to_string(),
+        }
+    })
+}
+
 /// Discovers and parses this bundle's single `model.gguf` file.
 pub fn discover_and_parse_weights(
     source: &ProductionModelSource,
@@ -135,15 +199,7 @@ pub fn discover_and_parse_weights(
             part: GGUF_FILE_NAME.to_string(),
         }
     })?;
-    let bytes = fs::read(&path).map_err(|error| ProductionIngestionError::RequiredPartMissing {
-        part: format!("{} ({error})", path.display()),
-    })?;
-    let artifact = magnetar_format_gguf::parse(&bytes).map_err(|error| {
-        ProductionIngestionError::MalformedMetadata {
-            reason: format!("{GGUF_FILE_NAME} failed to parse as GGUF: {error}"),
-        }
-    })?;
-    drop(bytes);
+    let artifact = parse_header(&path)?;
 
     let mut locations = BTreeMap::new();
     let mut tensors = Vec::with_capacity(artifact.tensors.len());

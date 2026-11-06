@@ -61,6 +61,15 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
     if name == "output" {
         return Ok("lm_head".to_string());
     }
+    if name == "rope_freqs" {
+        // llama.cpp stores a per-frequency RoPE scaling (Llama 3.1+) as
+        // precomputed factors, which no Model Component reads from GGUF.
+        return Err(ProductionIngestionError::UnsupportedFormat {
+            reason: "tensor 'rope_freqs.weight' declares a per-frequency RoPE scaling, which \
+                     GGUF loading does not support"
+                .into(),
+        });
+    }
     if let Some(layer_suffix) = name.strip_prefix("blk.") {
         let (layer_index, rest) = layer_suffix.split_once('.').ok_or_else(|| {
             ProductionIngestionError::MalformedMetadata {
