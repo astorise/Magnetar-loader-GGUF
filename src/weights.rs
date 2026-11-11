@@ -228,14 +228,13 @@ pub fn discover_and_parse_weights(
         // bytes (`execute-direct-quantized-weights`); its element count
         // must still be a whole number of its format's blocks.
         if let Some(block_elements) = match tensor.storage_dtype {
-            ModelDType::Q8 => Some(quant_blocks::Q8_0_BLOCK_ELEMENTS),
+            ModelDType::Q8 | ModelDType::Iq4Nl => Some(quant_blocks::Q8_0_BLOCK_ELEMENTS),
             ModelDType::Q2K
             | ModelDType::Q3K
+            | ModelDType::Iq4Xs
             | ModelDType::Q4K
             | ModelDType::Q5K
-            | ModelDType::Q6K => {
-                Some(quant_blocks::QK_BLOCK_ELEMENTS)
-            }
+            | ModelDType::Q6K => Some(quant_blocks::QK_BLOCK_ELEMENTS),
             _ => None,
         } {
             let elements = element_count(&tensor.shape)?;

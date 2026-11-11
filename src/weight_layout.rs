@@ -44,6 +44,8 @@ pub(crate) fn is_block_quantized(dtype: magnetar_runtime::model::ModelDType) -> 
         ModelDType::Q8
             | ModelDType::Q2K
             | ModelDType::Q3K
+            | ModelDType::Iq4Nl
+            | ModelDType::Iq4Xs
             | ModelDType::Q4K
             | ModelDType::Q5K
             | ModelDType::Q6K
