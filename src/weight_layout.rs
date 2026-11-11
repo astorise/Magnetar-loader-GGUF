@@ -39,7 +39,10 @@ fn is_transposed_projection(canonical_name: &str) -> bool {
 /// Model Loading or the Provider reads it accordingly.
 pub(crate) fn is_block_quantized(dtype: magnetar_runtime::model::ModelDType) -> bool {
     use magnetar_runtime::model::ModelDType;
-    matches!(dtype, ModelDType::Q8 | ModelDType::Q4K | ModelDType::Q5K)
+    matches!(
+        dtype,
+        ModelDType::Q8 | ModelDType::Q4K | ModelDType::Q5K | ModelDType::Q6K
+    )
 }
 
 /// Swaps every 2D projection tensor's declared shape from
