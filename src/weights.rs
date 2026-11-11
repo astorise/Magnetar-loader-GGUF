@@ -229,7 +229,11 @@ pub fn discover_and_parse_weights(
         // must still be a whole number of its format's blocks.
         if let Some(block_elements) = match tensor.storage_dtype {
             ModelDType::Q8 => Some(quant_blocks::Q8_0_BLOCK_ELEMENTS),
-            ModelDType::Q4K | ModelDType::Q5K | ModelDType::Q6K => {
+            ModelDType::Q2K
+            | ModelDType::Q3K
+            | ModelDType::Q4K
+            | ModelDType::Q5K
+            | ModelDType::Q6K => {
                 Some(quant_blocks::QK_BLOCK_ELEMENTS)
             }
             _ => None,

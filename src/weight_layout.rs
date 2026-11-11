@@ -41,7 +41,12 @@ pub(crate) fn is_block_quantized(dtype: magnetar_runtime::model::ModelDType) -> 
     use magnetar_runtime::model::ModelDType;
     matches!(
         dtype,
-        ModelDType::Q8 | ModelDType::Q4K | ModelDType::Q5K | ModelDType::Q6K
+        ModelDType::Q8
+            | ModelDType::Q2K
+            | ModelDType::Q3K
+            | ModelDType::Q4K
+            | ModelDType::Q5K
+            | ModelDType::Q6K
     )
 }
 
