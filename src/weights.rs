@@ -270,10 +270,16 @@ pub fn discover_and_parse_weights(
             };
             tensor.shape = vec![experts * out, inner];
         }
-        // The shared expert's scalar gate is a `[hidden]` vector: the
-        // `[hidden, 1]` matrix it multiplies by, over the same bytes.
-        if canonical.ends_with(".moe.shared_expert_gate") && tensor.shape.len() == 1 {
-            tensor.shape.push(1);
+        // The shared expert's scalar gate is a `[hidden]` vector, or a
+        // `[1, hidden]` matrix when the file keeps its singleton output
+        // dimension: either way the `[hidden, 1]` matrix it multiplies by,
+        // over the same bytes (one row and one column read alike).
+        if canonical.ends_with(".moe.shared_expert_gate") {
+            match tensor.shape[..] {
+                [hidden] => tensor.shape = vec![hidden, 1],
+                [1, hidden] => tensor.shape = vec![hidden, 1],
+                _ => {}
+            }
         }
         locations.insert(
             canonical.clone(),
@@ -436,6 +442,34 @@ mod tests {
             .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// The shared expert's scalar gate reads as `[hidden, 1]` whether the
+    /// file stores it as a `[hidden]` vector or keeps its singleton output
+    /// dimension (GGUF `ne = [hidden, 1]`, row-major `[1, hidden]`).
+    #[test]
+    fn shared_expert_gates_read_as_hidden_by_one() {
+        for dimensions in [vec![4_u64], vec![4, 1]] {
+            let dir = tempfile::tempdir().unwrap();
+            let file = build_gguf(
+                &[kv_string("general.name", "test-model")],
+                &[TestTensor {
+                    name: "blk.0.ffn_gate_inp_shexp.weight",
+                    dimensions: dimensions.clone(),
+                    ggml_type: 0,
+                    data: vec![0u8; 4 * 4],
+                }],
+                32,
+            );
+            fs::write(dir.path().join(GGUF_FILE_NAME), &file).unwrap();
+            let source = ProductionModelSource::authorized_local_bundle(
+                ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+                dir.path().to_path_buf(),
+            );
+            let (tensors, _, _) = discover_and_parse_weights(&source).unwrap();
+            assert_eq!(tensors[0].name, "layers.0.moe.shared_expert_gate");
+            assert_eq!(tensors[0].shape, vec![4, 1], "GGUF ne {dimensions:?}");
+        }
     }
 
     #[test]
