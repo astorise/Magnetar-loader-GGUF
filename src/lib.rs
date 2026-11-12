@@ -8,13 +8,10 @@
 //! Scoped to a single local `model.gguf` file declaring
 //! `general.architecture == "qwen2"` (the only architecture family a real
 //! Magnetar Model Component exists for). Tensors quantized with GGUF's
-//! `Q8_0`/`Q4_K`/`Q5_K` block formats are dequantized to `F32` at
-//! payload-read time, *before* the projection-weight transpose runs
-//! (`resolve-gguf-quantized-projection-transpose-sequencing`) -- that
-//! transpose assumes a flat per-element byte width, meaningless for
-//! block-quantized data, so every tensor this crate hands to later steps
-//! is genuinely `F32` by the time anything else looks at it, whether or
-//! not it started out quantized. GPTQ/AWQ/BitsAndBytes (Hugging Face/
+//! `Q8_0`/`Q4_K`/`Q5_K` block formats keep their original bytes and
+//! storage dtype; quantized projections declare transposed storage instead
+//! of being transposed byte by byte (`execute-direct-quantized-weights`),
+//! and Model Loading converts or hands them over packed. GPTQ/AWQ/BitsAndBytes (Hugging Face/
 //! Safetensors-shaped quantization schemes, unrelated to GGUF's block
 //! format) remain out of scope entirely.
 //!
@@ -26,14 +23,15 @@
 //! Loading may materialize anything from it.
 
 mod config;
-mod dequantize;
 mod derived_lm_head;
 mod naming;
+mod quant_blocks;
+mod rope_rows;
 mod tokenizer;
 mod weight_layout;
 mod weights;
 
-pub use config::SUPPORTED_ARCHITECTURE;
+pub use config::SUPPORTED_ARCHITECTURES;
 pub use naming::normalize_tensor_name;
 pub use tokenizer::GgufTokenizer;
 pub use weights::GgufPayloadSource;
@@ -107,14 +105,7 @@ pub fn load_gguf_chat_template(
             part: GGUF_FILE_NAME.to_string(),
         }
     })?;
-    let bytes = fs::read(&path).map_err(|error| ProductionIngestionError::RequiredPartMissing {
-        part: format!("{} ({error})", path.display()),
-    })?;
-    let artifact = magnetar_format_gguf::parse(&bytes).map_err(|error| {
-        ProductionIngestionError::MalformedMetadata {
-            reason: format!("{GGUF_FILE_NAME} failed to parse as GGUF: {error}"),
-        }
-    })?;
+    let artifact = weights::parse_header(&path)?;
     Ok(match artifact.metadata.get("tokenizer.chat_template") {
         Some(GgufMetadataValue::String(template)) => Some(template.clone()),
         _ => None,
@@ -140,14 +131,7 @@ pub fn load_gguf_tokenizer(
             part: GGUF_FILE_NAME.to_string(),
         }
     })?;
-    let bytes = fs::read(&path).map_err(|error| ProductionIngestionError::RequiredPartMissing {
-        part: format!("{} ({error})", path.display()),
-    })?;
-    let artifact = magnetar_format_gguf::parse(&bytes).map_err(|error| {
-        ProductionIngestionError::MalformedMetadata {
-            reason: format!("{GGUF_FILE_NAME} failed to parse as GGUF: {error}"),
-        }
-    })?;
+    let artifact = weights::parse_header(&path)?;
     GgufTokenizer::from_gguf_metadata(&artifact.metadata, artifact_id, expected_vocab_size)
 }
 
@@ -174,6 +158,7 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
             .ok_or_else(|| ProductionIngestionError::MalformedMetadata {
                 reason: "no token_embedding tensor was discovered".into(),
             })?;
+        let architecture = config::architecture(&metadata)?;
         let mut architecture_config = config::normalize(&metadata, vocab_size)?;
 
         // Neither real evidence GGUF's key-value metadata reliably
@@ -184,6 +169,18 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
         architecture_config.attention_bias = tensors
             .iter()
             .any(|tensor| tensor.name.ends_with("self_attn.q_bias"));
+        architecture_config.mixture_of_experts =
+            config::mixture_of_experts(&metadata, architecture, |name| {
+                tensors
+                    .iter()
+                    .find(|tensor| tensor.name == name)
+                    .map(|tensor| tensor.shape.clone())
+            })?;
+        architecture_config.validate().map_err(|error| {
+            ProductionIngestionError::MalformedMetadata {
+                reason: format!("GGUF mixture of experts is inconsistent: {error}"),
+            }
+        })?;
         let tie_word_embeddings = !tensors.iter().any(|tensor| tensor.name == "lm_head");
         architecture_config.tie_word_embeddings = tie_word_embeddings;
 
@@ -195,6 +192,12 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
         // change's design.md for the sourced research) -- the Component
         // expects `[in_features, out_features]` instead; see
         // `weight_layout.rs`.
+        let payload_source = rope_rows::RopeRowRestoringPayloadSource::new(
+            payload_source,
+            &mut tensors,
+            config::rope_rows_interleaved(architecture),
+            architecture_config.head_dim,
+        )?;
         let transposing_source =
             weight_layout::TransposingPayloadSource::new(payload_source, &tensors);
         weight_layout::swap_declared_projection_shapes(&mut tensors);
@@ -236,12 +239,13 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
         // itself, honestly representing "this manifest is anchored to
         // this exact file's real bytes" without fabricating a fake
         // separate digest for a part boundary GGUF does not have.
-        let file_bytes = fs::read(source.resolve(GGUF_FILE_NAME)?).map_err(|error| {
-            ProductionIngestionError::RequiredPartMissing {
+        let file_path = source.resolve(GGUF_FILE_NAME)?;
+        let file_length = fs::metadata(&file_path)
+            .map_err(|error| ProductionIngestionError::RequiredPartMissing {
                 part: format!("{GGUF_FILE_NAME} ({error})"),
-            }
-        })?;
-        let file_digest = ModelDigest::sha256(&file_bytes);
+            })?
+            .len();
+        let file_digest = weights::file_digest(&file_path)?;
 
         let mut parts = BTreeMap::new();
         parts.insert(
@@ -250,7 +254,7 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
                 name: "gguf_metadata".to_string(),
                 kind: ModelArtifactKind::ModelConfig,
                 digest: file_digest.clone(),
-                size_bytes: Some(file_bytes.len() as u64),
+                size_bytes: Some(file_length),
                 required: true,
             },
         );
@@ -297,7 +301,7 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
 
         let model_display_name = match metadata.get("general.name") {
             Some(GgufMetadataValue::String(name)) => name.as_str(),
-            _ => config::SUPPORTED_ARCHITECTURE,
+            _ => architecture,
         };
         let name = sanitize_model_name(model_display_name);
         let id = ModelArtifactId::new(
@@ -316,7 +320,12 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
         let manifest = ModelManifest {
             schema_version: magnetar_runtime::model::MODEL_ARTIFACT_SCHEMA_VERSION,
             id,
-            architecture: ModelArchitecture::new("qwen", config::SUPPORTED_ARCHITECTURE),
+            // The family is the checkpoint's own architecture name
+            // (`general.architecture`), as `loaders/huggingface` uses its
+            // `model_type`: one architecture names one family whichever
+            // format it came in, so the Model Component that declares it
+            // serves both.
+            architecture: ModelArchitecture::new(architecture, architecture),
             parts,
             storage_dtype,
             compute_dtype: None,
@@ -564,6 +573,9 @@ mod tests {
         let result = GgufIngestor::new().ingest(&source).expect("bundle ingests");
 
         assert!(result.manifest.architecture_config.is_some());
+        // The family is the checkpoint's own architecture name, as for a
+        // Hugging Face bundle's model_type.
+        assert_eq!(result.manifest.architecture.family, "qwen2");
         let config = result.manifest.architecture_config.clone().unwrap();
         assert_eq!(config.hidden_size, 2);
         assert_eq!(config.intermediate_size, 4);
@@ -680,16 +692,17 @@ mod tests {
         assert_eq!(values, vec![1.0, 3.0, 5.0, 7.0, 2.0, 4.0, 6.0, 8.0]);
     }
 
-    /// The exact scenario `resolve-gguf-quantized-projection-transpose-sequencing`
-    /// exists to fix: a *quantized*, *non-square* projection weight must
-    /// be dequantized before the projection transpose runs, not after --
-    /// applying the transpose to raw quantized bytes would silently
-    /// corrupt the block structure. Dimensions here (hidden=4,
-    /// intermediate=8) are sized to hold exactly one real `Q8_0` block (32
-    /// elements) for `ffn_gate` specifically, and are deliberately
+    /// A *quantized*, *non-square* projection weight is never transposed
+    /// byte by byte (that would corrupt its block structure,
+    /// `resolve-gguf-quantized-projection-transpose-sequencing`): it keeps
+    /// its packed bytes and declares transposed storage
+    /// (`execute-direct-quantized-weights`), and Model Loading's own
+    /// conversion yields the same transposed matrix the byte transpose used
+    /// to. Dimensions here (hidden=4, intermediate=8) hold exactly one real
+    /// `Q8_0` block (32 elements) for `ffn_gate` and are deliberately
     /// non-square so a transpose bug could not hide behind symmetry.
     #[test]
-    fn dequantizes_then_transposes_a_non_square_quantized_projection() {
+    fn keeps_a_non_square_quantized_projection_packed_and_declares_it_transposed() {
         const HIDDEN: u64 = 4;
         const INTERMEDIATE: u64 = 8;
         let kvs = vec![
@@ -806,27 +819,23 @@ mod tests {
             .unwrap();
         assert_eq!(
             ffn_gate.storage_dtype,
-            magnetar_runtime::model::ModelDType::F32,
-            "a dequantized tensor's declared storage dtype must be overridden to F32"
+            magnetar_runtime::model::ModelDType::Q8,
+            "a quantized tensor keeps its storage dtype"
         );
-        assert!(ffn_gate.quantization.is_none());
+        assert_eq!(
+            ffn_gate.layout.as_deref(),
+            Some(magnetar_runtime::packed_weight::TRANSPOSED_STORAGE_LAYOUT)
+        );
         // GGUF ne=[in=4, out=8] reversed to HF-native [out=8, in=4], then
         // swapped back to the Component's expected [in=4, out=8].
         assert_eq!(ffn_gate.shape, vec![HIDDEN, INTERMEDIATE]);
 
-        let range = magnetar_runtime::production_model_ingestion::ProductionPayloadRange {
-            identity: ffn_gate.name.clone(),
-            offset: ffn_gate.offset_bytes.unwrap(),
-            length: ffn_gate.size_bytes.unwrap(),
-            digest: None,
-        };
-        let bytes = result.payload_source.read_payload(&range).unwrap();
-        let values: Vec<f32> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|chunk| f32::from_le_bytes(*chunk))
-            .collect();
+        let values = magnetar_runtime::model_loading::host_tensor_from_payload_source(
+            ffn_gate,
+            result.payload_source.as_ref(),
+        )
+        .expect("Model Loading converts the packed, transposed-storage tensor")
+        .data;
         // Dequantized HF-native [out=8, in=4], row-major, is [[1,2,3,4],
         // [5,6,7,8], [9,10,11,12], [13,14,15,16], [17,18,19,20],
         // [21,22,23,24], [25,26,27,28], [29,30,31,32]]. Transposed to
@@ -864,9 +873,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_non_qwen2_architecture_end_to_end() {
+    fn rejects_an_unsupported_architecture_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
-        let kvs = vec![kv_string("general.architecture", "llama")];
+        let kvs = vec![kv_string("general.architecture", "gemma3")];
         let tensors = [TestTensor {
             name: "token_embd.weight",
             dimensions: vec![2, 4],

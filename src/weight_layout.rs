@@ -32,6 +32,31 @@ fn is_transposed_projection(canonical_name: &str) -> bool {
     canonical_name == "lm_head" || canonical_name.contains("proj")
 }
 
+/// Whether `dtype` is a block-quantized storage format: a per-element byte
+/// transpose is meaningless for it, so its bytes are never transposed
+/// here; the tensor instead declares transposed storage
+/// ([`magnetar_runtime::packed_weight::TRANSPOSED_STORAGE_LAYOUT`]) and
+/// Model Loading or the Provider reads it accordingly.
+pub(crate) fn is_block_quantized(dtype: magnetar_runtime::model::ModelDType) -> bool {
+    use magnetar_runtime::model::ModelDType;
+    matches!(
+        dtype,
+        ModelDType::Q8
+            | ModelDType::Q2K
+            | ModelDType::Q3K
+            | ModelDType::Iq4Nl
+            | ModelDType::Iq4Xs
+            | ModelDType::Iq2Xxs
+            | ModelDType::Iq2Xs
+            | ModelDType::Iq2S
+            | ModelDType::Iq3Xxs
+            | ModelDType::Iq3S
+            | ModelDType::Q4K
+            | ModelDType::Q5K
+            | ModelDType::Q6K
+    )
+}
+
 /// Swaps every 2D projection tensor's declared shape from
 /// `[out_features, in_features]` to `[in_features, out_features]`, in
 /// place, and clears its declared content digest (the digest, if any, was
@@ -43,7 +68,14 @@ pub fn swap_declared_projection_shapes(tensors: &mut [ModelTensorMetadata]) {
     for tensor in tensors.iter_mut() {
         if is_transposed_projection(&tensor.name) && tensor.shape.len() == 2 {
             tensor.shape.swap(0, 1);
-            tensor.digest = None;
+            if is_block_quantized(tensor.storage_dtype) {
+                // The bytes stay as stored, so a declared digest still
+                // describes them.
+                tensor.layout =
+                    Some(magnetar_runtime::packed_weight::TRANSPOSED_STORAGE_LAYOUT.to_string());
+            } else {
+                tensor.digest = None;
+            }
         }
     }
 }
@@ -70,7 +102,11 @@ impl<S> TransposingPayloadSource<S> {
     pub fn new(inner: S, tensors: &[ModelTensorMetadata]) -> Self {
         let original_shapes = tensors
             .iter()
-            .filter(|tensor| is_transposed_projection(&tensor.name) && tensor.shape.len() == 2)
+            .filter(|tensor| {
+                is_transposed_projection(&tensor.name)
+                    && tensor.shape.len() == 2
+                    && !is_block_quantized(tensor.storage_dtype)
+            })
             .map(|tensor| {
                 (
                     tensor.name.clone(),

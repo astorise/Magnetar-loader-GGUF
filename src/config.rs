@@ -2,23 +2,37 @@
 //! generic [`ModelArchitectureConfig`] (mirrors `loaders/huggingface`'s
 //! `config.rs`'s validation discipline exactly, reading GGUF's own
 //! `<architecture>.*`/`tokenizer.ggml.*` keys instead of a `config.json`).
-//! Scoped to `general.architecture == "qwen2"` -- the only architecture
-//! family a real Magnetar Model Component (`components/qwen`) exists for
-//! today; any other declared architecture is rejected structurally rather
-//! than guessed at.
+//! Scoped to the architectures in [`SUPPORTED_ARCHITECTURES`]; any other
+//! declared architecture is rejected structurally rather than guessed at.
 //!
-//! GGUF key names/types (`general.architecture`, `qwen2.embedding_length`,
-//! `qwen2.attention.head_count(_kv)`, `qwen2.attention.layer_norm_rms_epsilon`,
-//! `qwen2.rope.freq_base`, `tokenizer.ggml.{bos,eos}_token_id`) match the
-//! upstream `ggml-org/llama.cpp` GGUF writer's real Qwen2 conversion
-//! (`conversion/qwen.py`'s `Qwen2Model`), not a guessed schema.
+//! GGUF key names/types (`general.architecture`,
+//! `<arch>.embedding_length`, `<arch>.attention.head_count(_kv)`,
+//! `<arch>.attention.layer_norm_rms_epsilon`, `<arch>.rope.freq_base`,
+//! `tokenizer.ggml.{bos,eos}_token_id`) match the upstream
+//! `ggml-org/llama.cpp` GGUF writer's real conversions, not a guessed
+//! schema.
 
 use magnetar_format_gguf::GgufMetadataValue;
 use magnetar_runtime::model::ModelArchitectureConfig;
 use magnetar_runtime::production_model_ingestion::ProductionIngestionError;
 use std::collections::BTreeMap;
 
-pub const SUPPORTED_ARCHITECTURE: &str = "qwen2";
+/// The `general.architecture` values this loader reads. They share one
+/// decoder-block key schema (`<arch>.*`); they differ in how llama.cpp's
+/// converter stores the attention projections (see
+/// [`rope_rows_interleaved`]) and, for `qwen2moe`, in a routed
+/// mixture-of-experts MLP ([`mixture_of_experts`]).
+pub const SUPPORTED_ARCHITECTURES: [&str; 3] = ["qwen2", "llama", "qwen2moe"];
+
+/// Whether llama.cpp's converter permuted `architecture`'s query and key
+/// projection rows for its interleaved-pair RoPE: it does for `llama`
+/// (`LlamaModel.permute`), not for `qwen2`, whose RoPE rotates half-split
+/// pairs as the checkpoint stores them. A permuted projection is restored
+/// to the checkpoint's own row order at load (`rope_rows.rs`), so every
+/// architecture reaches the Model Component in its upstream layout.
+pub fn rope_rows_interleaved(architecture: &str) -> bool {
+    architecture == "llama"
+}
 
 fn malformed(reason: impl Into<String>) -> ProductionIngestionError {
     ProductionIngestionError::MalformedMetadata {
@@ -64,6 +78,66 @@ fn required_uint(
         .ok_or_else(|| malformed(format!("GGUF metadata is missing required key '{key}'")))
 }
 
+/// The routed mixture of experts a `qwen2moe` file declares, from its
+/// `<arch>.expert_count`/`expert_used_count` metadata and the stored
+/// shapes of layer 0's stacked experts (`[experts * intermediate,
+/// hidden]`) and shared expert (`[shared, hidden]`); `None` for a dense
+/// architecture. llama.cpp's `qwen2moe` never renormalizes the chosen
+/// experts' probabilities (Hugging Face `norm_topk_prob = false`).
+pub fn mixture_of_experts(
+    metadata: &BTreeMap<String, GgufMetadataValue>,
+    architecture: &str,
+    stored_shape: impl Fn(&str) -> Option<Vec<u64>>,
+) -> Result<Option<magnetar_runtime::model::MixtureOfExpertsConfig>, ProductionIngestionError> {
+    if architecture != "qwen2moe" {
+        return Ok(None);
+    }
+    let key = |name: &str| format!("{architecture}.{name}");
+    let count = |name: &str| -> Result<u32, ProductionIngestionError> {
+        u32::try_from(required_uint(metadata, &key(name))?)
+            .map_err(|_| malformed(format!("GGUF metadata's {name} does not fit in a u32")))
+    };
+    let experts = count("expert_count")?;
+    let experts_per_token = count("expert_used_count")?;
+    let rows = |name: &str| {
+        stored_shape(name)
+            .and_then(|shape| shape.first().copied())
+            .ok_or_else(|| malformed(format!("a mixture-of-experts file has no '{name}' tensor")))
+    };
+    let stacked = rows("layers.0.moe.experts_gate_proj")?;
+    if experts == 0 || !stacked.is_multiple_of(u64::from(experts)) {
+        return Err(malformed(format!(
+            "{stacked} stacked expert rows are not {experts} equal experts"
+        )));
+    }
+    let shared_expert_intermediate_size =
+        stored_shape("layers.0.moe.shared_gate_proj").and_then(|shape| shape.first().copied());
+    Ok(Some(magnetar_runtime::model::MixtureOfExpertsConfig {
+        experts,
+        experts_per_token,
+        expert_intermediate_size: stacked / u64::from(experts),
+        shared_expert_intermediate_size,
+        normalize_top_k: false,
+    }))
+}
+
+/// `general.architecture`, when it is one this loader reads.
+pub fn architecture(
+    metadata: &BTreeMap<String, GgufMetadataValue>,
+) -> Result<&'static str, ProductionIngestionError> {
+    let architecture = string_value(metadata, "general.architecture")
+        .ok_or_else(|| malformed("GGUF metadata is missing required key 'general.architecture'"))?;
+    SUPPORTED_ARCHITECTURES
+        .into_iter()
+        .find(|supported| *supported == architecture)
+        .ok_or_else(|| ProductionIngestionError::UnsupportedFormat {
+            reason: format!(
+                "GGUF declares architecture '{architecture}'; only {SUPPORTED_ARCHITECTURES:?} \
+                 are supported"
+            ),
+        })
+}
+
 /// Normalizes a GGUF file's key-value metadata into a
 /// [`ModelArchitectureConfig`], given `vocab_size` (the real embedding
 /// table row count, derived from the discovered `token_embedding`
@@ -83,28 +157,18 @@ pub fn normalize(
     metadata: &BTreeMap<String, GgufMetadataValue>,
     vocab_size: u64,
 ) -> Result<ModelArchitectureConfig, ProductionIngestionError> {
-    let architecture = string_value(metadata, "general.architecture")
-        .ok_or_else(|| malformed("GGUF metadata is missing required key 'general.architecture'"))?;
-    if architecture != SUPPORTED_ARCHITECTURE {
-        return Err(ProductionIngestionError::UnsupportedFormat {
-            reason: format!(
-                "GGUF declares architecture '{architecture}'; only '{SUPPORTED_ARCHITECTURE}' \
-                 has a real production Model Component today"
-            ),
-        });
-    }
+    let architecture = architecture(metadata)?;
+    let key = |name: &str| format!("{architecture}.{name}");
 
-    let hidden_size = required_uint(metadata, "qwen2.embedding_length")?;
-    let intermediate_size = required_uint(metadata, "qwen2.feed_forward_length")?;
-    let num_hidden_layers = u32::try_from(required_uint(metadata, "qwen2.block_count")?)
-        .map_err(|_| malformed("GGUF metadata's 'qwen2.block_count' does not fit in a u32"))?;
-    let num_attention_heads = u32::try_from(required_uint(metadata, "qwen2.attention.head_count")?)
-        .map_err(|_| {
-            malformed("GGUF metadata's 'qwen2.attention.head_count' does not fit in a u32")
-        })?;
-    let num_key_value_heads = match uint_value(metadata, "qwen2.attention.head_count_kv") {
+    let hidden_size = required_uint(metadata, &key("embedding_length"))?;
+    let intermediate_size = required_uint(metadata, &key("feed_forward_length"))?;
+    let num_hidden_layers = u32::try_from(required_uint(metadata, &key("block_count"))?)
+        .map_err(|_| malformed("GGUF metadata's block_count does not fit in a u32"))?;
+    let num_attention_heads = u32::try_from(required_uint(metadata, &key("attention.head_count"))?)
+        .map_err(|_| malformed("GGUF metadata's attention.head_count does not fit in a u32"))?;
+    let num_key_value_heads = match uint_value(metadata, &key("attention.head_count_kv")) {
         Some(value) => u32::try_from(value).map_err(|_| {
-            malformed("GGUF metadata's 'qwen2.attention.head_count_kv' does not fit in a u32")
+            malformed("GGUF metadata's attention.head_count_kv does not fit in a u32")
         })?,
         None => num_attention_heads,
     };
@@ -122,17 +186,17 @@ pub fn normalize(
     }
     if !num_attention_heads.is_multiple_of(num_key_value_heads) {
         return Err(malformed(format!(
-            "GGUF metadata's qwen2.attention.head_count ({num_attention_heads}) is not an exact \
+            "GGUF metadata's attention.head_count ({num_attention_heads}) is not an exact \
              multiple of head_count_kv ({num_key_value_heads})"
         )));
     }
 
-    let head_dim = match uint_value(metadata, "qwen2.attention.key_length") {
+    let head_dim = match uint_value(metadata, &key("attention.key_length")) {
         Some(declared) => declared,
         None => {
             if !hidden_size.is_multiple_of(u64::from(num_attention_heads)) {
                 return Err(malformed(format!(
-                    "GGUF metadata declares no qwen2.attention.key_length and embedding_length \
+                    "GGUF metadata declares no attention.key_length and embedding_length \
                      ({hidden_size}) is not evenly divisible by attention.head_count \
                      ({num_attention_heads})"
                 )));
@@ -147,12 +211,10 @@ pub fn normalize(
     }
 
     let rms_norm_eps =
-        float_value(metadata, "qwen2.attention.layer_norm_rms_epsilon").unwrap_or(1e-6) as f32;
-    let rope_theta = float_value(metadata, "qwen2.rope.freq_base").unwrap_or(10_000.0);
+        float_value(metadata, &key("attention.layer_norm_rms_epsilon")).unwrap_or(1e-6) as f32;
+    let rope_theta = float_value(metadata, &key("rope.freq_base")).unwrap_or(10_000.0);
     if rope_theta <= 0.0 {
-        return Err(malformed(
-            "GGUF metadata's qwen2.rope.freq_base must be positive",
-        ));
+        return Err(malformed("GGUF metadata's rope.freq_base must be positive"));
     }
 
     let architecture_config = ModelArchitectureConfig {
@@ -165,15 +227,16 @@ pub fn normalize(
         vocab_size,
         rms_norm_eps,
         rope_theta,
-        rope_scaling_factor: float_value(metadata, "qwen2.rope.scaling.factor")
+        rope_scaling_factor: float_value(metadata, &key("rope.scaling.factor"))
             .map(|value| value as f32),
-        // This loader reads `qwen2.*` metadata only, which declares no
-        // per-frequency RoPE scaling.
+        // A per-frequency RoPE scaling is stored as a `rope_freqs` tensor,
+        // which `lib.rs` rejects.
         rope_frequency_scaling: None,
         // Patched to real tensor-derived evidence by the caller; see this
         // function's own doc comment.
         tie_word_embeddings: false,
         attention_bias: false,
+        mixture_of_experts: None,
         bos_token_id: uint_value(metadata, "tokenizer.ggml.bos_token_id")
             .and_then(|value| u32::try_from(value).ok()),
         eos_token_id: uint_value(metadata, "tokenizer.ggml.eos_token_id")
@@ -248,11 +311,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_non_qwen2_architecture() {
+    fn reads_the_same_keys_under_the_llama_architecture() {
+        let metadata: BTreeMap<String, GgufMetadataValue> = qwen2_0_5b_metadata()
+            .into_iter()
+            .map(|(key, value)| match key.strip_prefix("qwen2.") {
+                Some(rest) => (format!("llama.{rest}"), value),
+                None if key == "general.architecture" => {
+                    (key, GgufMetadataValue::String("llama".into()))
+                }
+                None => (key, value),
+            })
+            .collect();
+        let llama = normalize(&metadata, 151936).unwrap();
+        let qwen2 = normalize(&qwen2_0_5b_metadata(), 151936).unwrap();
+        assert_eq!(llama, qwen2);
+        assert!(rope_rows_interleaved(architecture(&metadata).unwrap()));
+        assert!(!rope_rows_interleaved(
+            architecture(&qwen2_0_5b_metadata()).unwrap()
+        ));
+    }
+
+    #[test]
+    fn rejects_an_unsupported_architecture() {
         let mut metadata = qwen2_0_5b_metadata();
         metadata.insert(
             "general.architecture".into(),
-            GgufMetadataValue::String("llama".into()),
+            GgufMetadataValue::String("gemma3".into()),
         );
         let error = normalize(&metadata, 151936).unwrap_err();
         assert!(matches!(

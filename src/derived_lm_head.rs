@@ -37,7 +37,15 @@ pub fn append_synthetic_lm_head_if_tied(
     let mut lm_head = token_embedding.clone();
     lm_head.name = LM_HEAD.to_string();
     lm_head.shape.swap(0, 1);
-    lm_head.digest = None;
+    if crate::weight_layout::is_block_quantized(lm_head.storage_dtype) {
+        // A block-quantized table is not transposed byte by byte: the
+        // derived lm_head is the table's own bytes, declared as transposed
+        // storage, and its digest still describes them.
+        lm_head.layout =
+            Some(magnetar_runtime::packed_weight::TRANSPOSED_STORAGE_LAYOUT.to_string());
+    } else {
+        lm_head.digest = None;
+    }
     tensors.push(lm_head);
     true
 }
@@ -52,6 +60,8 @@ pub struct DerivedLmHeadPayloadSource<S> {
     vocab_size: u64,
     hidden_size: u64,
     element_bytes: u64,
+    /// The table's bytes are served untransposed (block-quantized storage).
+    transposed_storage: bool,
 }
 
 impl<S> DerivedLmHeadPayloadSource<S> {
@@ -73,6 +83,9 @@ impl<S> DerivedLmHeadPayloadSource<S> {
             vocab_size,
             hidden_size,
             element_bytes: token_embedding.storage_dtype.descriptor().size_bytes(),
+            transposed_storage: crate::weight_layout::is_block_quantized(
+                token_embedding.storage_dtype,
+            ),
         })
     }
 }
@@ -88,6 +101,9 @@ impl<S: ProductionArtifactPayloadSource> ProductionArtifactPayloadSource
             return self.inner.read_payload(range);
         }
         let bytes = self.inner.read_payload(&self.token_embedding_range)?;
+        if self.transposed_storage {
+            return Ok(bytes);
+        }
         let element_count = self
             .vocab_size
             .checked_mul(self.hidden_size)
@@ -187,6 +203,50 @@ mod tests {
         ];
         assert!(!append_synthetic_lm_head_if_tied(&mut tensors, true));
         assert_eq!(tensors.len(), 2);
+    }
+
+    /// A tied `Q8_0` table (`execute-direct-quantized-weights`): the derived
+    /// lm_head serves the table's own packed bytes and declares them as
+    /// transposed storage, keeping their digest, instead of a per-element
+    /// byte transpose that would corrupt the blocks. Model Loading's
+    /// conversion then yields the transpose of the dequantized table.
+    #[test]
+    fn derives_a_block_quantized_lm_head_as_the_tables_transposed_storage() {
+        // vocab = 2 rows of hidden = 32 values: d = 1.0 then d = 0.5.
+        let mut raw = 0x3C00_u16.to_le_bytes().to_vec();
+        raw.extend((0..32).map(|i| i as u8));
+        raw.extend(0x3800_u16.to_le_bytes());
+        raw.extend((0..32).map(|i| (100 - i) as u8));
+        let mut token_embedding = tensor("token_embedding", vec![2, 32]);
+        token_embedding.storage_dtype = ModelDType::Q8;
+        token_embedding.size_bytes = Some(raw.len() as u64);
+        token_embedding.digest = Some(magnetar_runtime::model::ModelDigest::sha256(&raw));
+        let mut tensors = vec![token_embedding.clone()];
+        assert!(append_synthetic_lm_head_if_tied(&mut tensors, true));
+        let lm_head = &tensors[1];
+        assert_eq!(lm_head.shape, vec![32, 2]);
+        assert_eq!(
+            lm_head.layout.as_deref(),
+            Some(magnetar_runtime::packed_weight::TRANSPOSED_STORAGE_LAYOUT)
+        );
+        assert_eq!(lm_head.digest, token_embedding.digest);
+
+        let source = DerivedLmHeadPayloadSource::new(
+            FixedPayloadSource(BTreeMap::from([(
+                "token_embedding".to_string(),
+                raw.clone(),
+            )])),
+            &token_embedding,
+        )
+        .unwrap();
+        let converted =
+            magnetar_runtime::model_loading::host_tensor_from_payload_source(lm_head, &source)
+                .unwrap();
+        assert_eq!(converted.shape, vec![32, 2]);
+        for h in 0..32 {
+            assert_eq!(converted.data[h * 2], h as f32);
+            assert_eq!(converted.data[h * 2 + 1], 0.5 * (100 - h) as f32);
+        }
     }
 
     #[test]

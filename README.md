@@ -12,13 +12,23 @@ programmatically from the GGUF file's own embedded vocabulary -- no
 separate `config.json`/`tokenizer.json` files, unlike a Hugging Face
 bundle (see `loaders/huggingface`).
 
-Scoped to `general.architecture == "qwen2"` (the only architecture family
-a real Magnetar Model Component exists for). A GGUF file may declare
-`F32`/`F16`/`BF16` tensors, or `Q8_0`/`Q4_K`/`Q5_K` block-quantized
-tensors -- the latter are dequantized to `F32` right here, before this
-crate's own projection-weight transpose runs (`resolve-gguf-quantized-
-projection-transpose-sequencing`), since that transpose assumes a flat
-per-element byte width that block-quantized data does not have.
+Scoped to `general.architecture` `qwen2` and `llama` (one `<arch>.*` key
+schema; the family the manifest declares is the file's own architecture,
+so the Model Component declaring it serves the file -- a Mistral 7B
+export, which llama.cpp writes as `llama`, is served by the Llama
+Component). llama.cpp's converter permutes a `llama` file's query and key
+projection rows for its interleaved-pair RoPE; `src/rope_rows.rs` restores
+the upstream row order at read time, so the Component's half-split RoPE
+applies unchanged. A per-frequency RoPE scaling (`rope_freqs.weight`,
+Llama 3.1+) is rejected. The tokenizer is a byte-level BPE
+(`tokenizer.ggml.model = gpt2`) or a SentencePiece BPE (`llama`, rebuilt
+from the pieces' scores with byte fallback, matching the upstream
+`tokenizer.json`). The header is parsed from a prefix of the file and the
+file digest is streamed, so a multi-gigabyte checkpoint is never read into
+memory whole. A GGUF file may declare `F32`/`F16`/`BF16` tensors, or
+`Q8_0`/`Q4_K`/`Q5_K` block-quantized tensors, whose bytes are served
+packed (`execute-direct-quantized-weights`): Model Loading hands a packed
+matrix to a Provider that computes from it, or dequantizes it.
 GPTQ/AWQ/BitsAndBytes (unrelated, Hugging Face/Safetensors-shaped
 quantization schemes) remain out of scope entirely.
 
