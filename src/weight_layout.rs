@@ -29,7 +29,10 @@ use std::collections::BTreeMap;
 /// via the shared `proj` substring -- deliberately not `token_embedding`
 /// (a lookup table) or the 1D normalization vectors.
 fn is_transposed_projection(canonical_name: &str) -> bool {
-    canonical_name == "lm_head" || canonical_name.contains("proj")
+    canonical_name == "lm_head"
+        || canonical_name.contains("proj")
+        // A per-layer input gate is a projection too.
+        || canonical_name.ends_with(".per_layer_input_gate")
 }
 
 /// Whether `dtype` is a block-quantized storage format: a per-element byte
