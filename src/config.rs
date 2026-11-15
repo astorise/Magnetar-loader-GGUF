@@ -241,6 +241,8 @@ pub fn normalize(
             .and_then(|value| u32::try_from(value).ok()),
         eos_token_id: uint_value(metadata, "tokenizer.ggml.eos_token_id")
             .and_then(|value| u32::try_from(value).ok()),
+        // `layer_layout` and the `1.6.0` options: uniform layers, none.
+        ..ModelArchitectureConfig::default()
     };
     architecture_config.validate().map_err(|error| {
         malformed(format!(
