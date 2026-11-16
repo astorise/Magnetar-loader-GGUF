@@ -16,7 +16,7 @@ pub const QK_BLOCK_ELEMENTS: u64 = 256;
 pub fn block_elements(dtype: magnetar_runtime::model::ModelDType) -> Option<u64> {
     use magnetar_runtime::model::ModelDType;
     match dtype {
-        ModelDType::Q8 | ModelDType::Iq4Nl => Some(Q8_0_BLOCK_ELEMENTS),
+        ModelDType::Q4 | ModelDType::Q8 | ModelDType::Iq4Nl => Some(Q8_0_BLOCK_ELEMENTS),
         ModelDType::Q2K
         | ModelDType::Q3K
         | ModelDType::Iq4Xs
