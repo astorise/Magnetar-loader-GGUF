@@ -201,6 +201,17 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
                     .find(|tensor| tensor.name == name)
                     .map(|tensor| tensor.shape.clone())
             })?;
+        (
+            architecture_config.moe_layers,
+            architecture_config.expert_routing,
+        ) = config::expert_layers_and_routing(
+            &metadata,
+            architecture,
+            &architecture_config,
+            tensors
+                .iter()
+                .any(|tensor| tensor.name.ends_with(".moe.selection_bias")),
+        )?;
         architecture_config.validate().map_err(|error| {
             ProductionIngestionError::MalformedMetadata {
                 reason: format!("GGUF layer layout or mixture of experts is inconsistent: {error}"),
@@ -1326,5 +1337,351 @@ mod tests {
     #[test]
     fn ingestor_id_is_stable() {
         assert_eq!(GgufIngestor::new().ingestor_id(), INGESTOR_ID);
+    }
+
+    fn kv_bool(key: &str, value: bool) -> Vec<u8> {
+        let mut out = gguf_string(key);
+        out.extend(le_u32(7));
+        out.push(u8::from(value));
+        out
+    }
+
+    /// How a `deepseek2` file stores the latent's key and value projection.
+    #[derive(Clone, Copy, Debug)]
+    enum KeyValueUp {
+        /// `attn_kv_b`, as converted before llama.cpp split it.
+        Fused,
+        /// `attn_k_b` (each head transposed) and `attn_v_b`, in `f32`.
+        Split,
+        /// The same, with `attn_k_b` in `Q8_0` (`nope` must be 32).
+        SplitQ8,
+    }
+
+    /// A two-layer `deepseek2` file (hidden 4, 2 heads of `nope` + 2
+    /// rotated, values 4 wide, latent 2): a dense first layer, then 2
+    /// sigmoid-routed experts of width 2 with a selection bias and one
+    /// shared expert. Returns the file and each layer's Hugging Face
+    /// `kv_b_proj` (`[heads * (nope + 4), 2]`, row-major), from which the
+    /// split form is written as llama.cpp's converter writes it: `k_b =
+    /// kv_b.view(heads, nope + v, latent)[:, :nope].transpose(1, 2)` and
+    /// `v_b = ...[:, nope:]`.
+    fn deepseek2_gguf(nope: u64, form: KeyValueUp) -> (Vec<u8>, Vec<Vec<f32>>) {
+        let (heads, rope, value, latent, hidden) = (2u64, 2u64, 4u64, 2u64, 4u64);
+        let mut kvs = vec![
+            kv_string("general.architecture", "deepseek2"),
+            kv_string("general.name", "tiny-deepseek2-test"),
+            kv_uint32("deepseek2.embedding_length", hidden as u32),
+            kv_uint32("deepseek2.feed_forward_length", 6),
+            kv_uint32("deepseek2.block_count", 2),
+            kv_uint32("deepseek2.attention.head_count", heads as u32),
+            kv_float32("deepseek2.attention.layer_norm_rms_epsilon", 1e-6),
+            kv_float32("deepseek2.rope.freq_base", 10_000.0),
+            kv_uint32("deepseek2.rope.dimension_count", rope as u32),
+            kv_uint32("deepseek2.attention.kv_lora_rank", latent as u32),
+            kv_uint32("deepseek2.leading_dense_block_count", 1),
+            kv_uint32("deepseek2.expert_count", 2),
+            kv_uint32("deepseek2.expert_used_count", 1),
+            kv_uint32("deepseek2.expert_feed_forward_length", 2),
+            kv_uint32("deepseek2.expert_shared_count", 1),
+            kv_float32("deepseek2.expert_weights_scale", 1.5),
+            kv_bool("deepseek2.expert_weights_norm", true),
+            kv_uint32("deepseek2.expert_gating_func", 2),
+            kv_string("deepseek2.rope.scaling.type", "yarn"),
+            kv_float32("deepseek2.rope.scaling.factor", 4.0),
+            kv_uint32("deepseek2.rope.scaling.original_context_length", 16),
+            kv_float32("deepseek2.rope.scaling.yarn_log_multiplier", 0.0707),
+            kv_uint32("tokenizer.ggml.bos_token_id", 0),
+            kv_uint32("tokenizer.ggml.eos_token_id", 1),
+            kv_string("tokenizer.ggml.model", "gpt2"),
+            kv_string_array(
+                "tokenizer.ggml.tokens",
+                &["<bos>", "<eos>", "hello", "world"],
+            ),
+            kv_string_array("tokenizer.ggml.merges", &[]),
+        ];
+        match form {
+            KeyValueUp::Fused => kvs.extend([
+                kv_uint32("deepseek2.attention.head_count_kv", heads as u32),
+                kv_uint32("deepseek2.attention.key_length", (nope + rope) as u32),
+                kv_uint32("deepseek2.attention.value_length", value as u32),
+            ]),
+            // The converter's MQA form: one latent "head".
+            KeyValueUp::Split | KeyValueUp::SplitQ8 => kvs.extend([
+                kv_uint32("deepseek2.attention.head_count_kv", 1),
+                kv_uint32("deepseek2.attention.key_length", (latent + rope) as u32),
+                kv_uint32("deepseek2.attention.value_length", latent as u32),
+                kv_uint32("deepseek2.attention.key_length_mla", (nope + rope) as u32),
+                kv_uint32("deepseek2.attention.value_length_mla", value as u32),
+            ]),
+        }
+        let next = std::cell::Cell::new(0u32);
+        // Distinct values in every tensor.
+        let values = |count: u64| -> Vec<f32> {
+            (0..count)
+                .map(|_| {
+                    next.set(next.get() + 1);
+                    next.get() as f32 * 0.25
+                })
+                .collect()
+        };
+        let tensor = |name: String, dimensions: Vec<u64>, data: Vec<f32>| TestTensor {
+            name: Box::leak(name.into_boxed_str()),
+            dimensions,
+            ggml_type: 0,
+            data: f32_bytes(&data),
+        };
+        let float = |name: String, dimensions: Vec<u64>| {
+            let count = dimensions.iter().product();
+            tensor(name, dimensions, values(count))
+        };
+        // GGUF `ne` order: `[in, out]`, `[in, out, heads or experts]`.
+        let mut tensors = vec![
+            float("token_embd.weight".into(), vec![hidden, 4]),
+            float("output_norm.weight".into(), vec![hidden]),
+            float("output.weight".into(), vec![hidden, 4]),
+        ];
+        let mut kv_b_per_layer = Vec::new();
+        for layer in 0..2 {
+            let name = |field: &str| format!("blk.{layer}.{field}.weight");
+            tensors.extend([
+                float(name("attn_norm"), vec![hidden]),
+                float(name("attn_q"), vec![hidden, heads * (nope + rope)]),
+                float(name("attn_kv_a_mqa"), vec![hidden, latent + rope]),
+                float(name("attn_kv_a_norm"), vec![latent]),
+                float(name("attn_output"), vec![heads * value, hidden]),
+                float(name("ffn_norm"), vec![hidden]),
+            ]);
+            let kv_b = values(heads * (nope + value) * latent);
+            let at = |head: u64, row: u64, column: u64| {
+                kv_b[((head * (nope + value) + row) * latent + column) as usize]
+            };
+            match form {
+                KeyValueUp::Fused => tensors.push(tensor(
+                    name("attn_kv_b"),
+                    vec![latent, heads * (nope + value)],
+                    kv_b.clone(),
+                )),
+                KeyValueUp::Split | KeyValueUp::SplitQ8 => {
+                    // `[heads, latent, nope]` and `[heads, value, latent]`.
+                    let k_b: Vec<f32> = (0..heads)
+                        .flat_map(|head| {
+                            (0..latent).flat_map(move |column| {
+                                (0..nope).map(move |row| (head, row, column))
+                            })
+                        })
+                        .map(|(head, row, column)| at(head, row, column))
+                        .collect();
+                    let v_b: Vec<f32> = (0..heads)
+                        .flat_map(|head| {
+                            (0..value).flat_map(move |row| {
+                                (0..latent).map(move |column| (head, row, column))
+                            })
+                        })
+                        .map(|(head, row, column)| at(head, nope + row, column))
+                        .collect();
+                    let mut keys = tensor(name("attn_k_b"), vec![nope, latent, heads], k_b);
+                    if matches!(form, KeyValueUp::SplitQ8) {
+                        // One block per row; the expected values are the
+                        // blocks' own (`q8_block`), so `kv_b` follows them.
+                        keys.ggml_type = 8;
+                        keys.data = (0..heads * latent)
+                            .flat_map(|row| q8_block(row as u8 * 32))
+                            .collect();
+                    }
+                    tensors.push(keys);
+                    tensors.push(tensor(name("attn_v_b"), vec![latent, value, heads], v_b));
+                }
+            }
+            kv_b_per_layer.push(kv_b);
+            if layer == 0 {
+                tensors.extend([
+                    float(name("ffn_gate"), vec![hidden, 6]),
+                    float(name("ffn_up"), vec![hidden, 6]),
+                    float(name("ffn_down"), vec![6, hidden]),
+                ]);
+                continue;
+            }
+            tensors.extend([
+                float(name("ffn_gate_inp"), vec![hidden, 2]),
+                float(name("ffn_gate_exps"), vec![hidden, 2, 2]),
+                float(name("ffn_up_exps"), vec![hidden, 2, 2]),
+                float(name("ffn_down_exps"), vec![2, hidden, 2]),
+                float(name("ffn_gate_shexp"), vec![hidden, 2]),
+                float(name("ffn_up_shexp"), vec![hidden, 2]),
+                float(name("ffn_down_shexp"), vec![2, hidden]),
+                float(format!("blk.{layer}.exp_probs_b.bias"), vec![2]),
+            ]);
+        }
+        (build_gguf(&kvs, &tensors, 32), kv_b_per_layer)
+    }
+
+    fn ingest_bytes(file: Vec<u8>) -> ProductionIngestionResult {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(GGUF_FILE_NAME), file).unwrap();
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let result = GgufIngestor::new().ingest(&source).expect("file ingests");
+        // Keep the file alive for the reads.
+        std::mem::forget(dir);
+        result
+    }
+
+    /// Tensor `name`'s logical shape and `f32` values.
+    fn read_f32(result: &ProductionIngestionResult, name: &str) -> (Vec<u64>, Vec<f32>) {
+        let tensor = result
+            .manifest
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == name)
+            .unwrap_or_else(|| panic!("no tensor '{name}'"));
+        assert_eq!(
+            tensor.storage_dtype,
+            magnetar_runtime::model::ModelDType::F32,
+            "{name}"
+        );
+        let bytes = result
+            .payload_source
+            .read_payload(
+                &magnetar_runtime::production_model_ingestion::ProductionPayloadRange {
+                    identity: tensor.name.clone(),
+                    offset: tensor.offset_bytes.unwrap(),
+                    length: tensor.size_bytes.unwrap(),
+                    digest: tensor.digest.clone(),
+                },
+            )
+            .unwrap();
+        let values = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        (tensor.shape.clone(), values)
+    }
+
+    /// `express-latent-attention-forms`: a `deepseek2` file declares
+    /// latent attention, YaRN, its dense and routed layers and its routing,
+    /// and its latent-attention projections reach the Component split, from
+    /// either form of the key and value projection.
+    #[test]
+    fn ingests_a_latent_attention_deepseek2_file_in_either_key_value_form() {
+        let (nope, heads, value, latent) = (3u64, 2u64, 4u64, 2u64);
+        let mut derived = Vec::new();
+        for form in [KeyValueUp::Fused, KeyValueUp::Split] {
+            let (file, kv_b) = deepseek2_gguf(nope, form);
+            let result = ingest_bytes(file);
+            let config = result.manifest.architecture_config.clone().unwrap();
+            assert_eq!(
+                config.latent_attention,
+                Some(magnetar_runtime::model::LatentAttentionConfig {
+                    q_lora_rank: None,
+                    kv_lora_rank: 2,
+                    qk_nope_head_dim: 3,
+                    qk_rope_head_dim: 2,
+                    v_head_dim: 4,
+                }),
+                "{form:?}"
+            );
+            assert_eq!((config.head_dim, config.num_key_value_heads), (5, 2));
+            assert_eq!(config.rope_scaling_factor, None);
+            let Some(magnetar_runtime::model::RopeFrequencyScaling::Yarn {
+                scaling,
+                mscale_all_dim,
+            }) = config.rope_frequency_scaling
+            else {
+                panic!("no YaRN: {:?}", config.rope_frequency_scaling);
+            };
+            assert_eq!((scaling.factor, scaling.original_context_length), (4.0, 16));
+            assert_eq!((scaling.beta_fast, scaling.beta_slow), (32.0, 1.0));
+            assert_eq!((scaling.attention_factor, scaling.truncate), (1.0, true));
+            assert!((mscale_all_dim.unwrap() - 0.707).abs() < 1e-6);
+            assert_eq!(
+                config.mixture_of_experts,
+                Some(magnetar_runtime::model::MixtureOfExpertsConfig {
+                    experts: 2,
+                    experts_per_token: 1,
+                    expert_intermediate_size: 2,
+                    shared_expert_intermediate_size: Some(2),
+                    normalize_top_k: true,
+                })
+            );
+            assert_eq!(config.moe_layers, Some(vec![false, true]));
+            assert_eq!(
+                config.expert_routing,
+                Some(magnetar_runtime::model::ExpertRoutingConfig {
+                    scoring: magnetar_runtime::model::ExpertScoring::Sigmoid,
+                    groups: None,
+                    routed_scaling_factor: 1.5,
+                    selection_bias: true,
+                    shared_expert_gated: false,
+                })
+            );
+            for (name, shape) in [
+                ("self_attn.q_nope_proj", vec![4, 6]),
+                ("self_attn.q_rope_proj", vec![4, 4]),
+                ("self_attn.kv_a_proj", vec![4, 2]),
+                ("self_attn.k_rope_proj", vec![4, 2]),
+                ("self_attn.k_nope_proj", vec![2, 6]),
+                ("self_attn.v_proj", vec![2, 8]),
+                ("self_attn.o_proj", vec![8, 4]),
+            ] {
+                assert_eq!(
+                    read_f32(&result, &format!("layers.1.{name}")).0,
+                    shape,
+                    "{name}"
+                );
+            }
+            assert_eq!(read_f32(&result, "layers.1.moe.selection_bias").0, vec![2]);
+            assert!(
+                !result
+                    .manifest
+                    .tensors
+                    .iter()
+                    .any(|tensor| tensor.name.contains("packed."))
+            );
+            // `[latent, heads * width]`: (l, h * width + j) is `kv_b`'s row
+            // `h * (nope + value) + offset + j`, column `l`.
+            for (layer, kv_b) in kv_b.iter().enumerate() {
+                for (name, offset, width) in [("k_nope_proj", 0, nope), ("v_proj", nope, value)] {
+                    let expected: Vec<f32> = (0..latent)
+                        .flat_map(|l| (0..heads * width).map(move |column| (l, column)))
+                        .map(|(l, column)| {
+                            let (head, j) = (column / width, column % width);
+                            kv_b[((head * (nope + value) + offset + j) * latent + l) as usize]
+                        })
+                        .collect();
+                    let (_, values) =
+                        read_f32(&result, &format!("layers.{layer}.self_attn.{name}"));
+                    assert_eq!(values, expected, "{form:?} layer {layer} {name}");
+                }
+            }
+            derived.push(read_f32(&result, "layers.1.self_attn.q_nope_proj").0);
+        }
+        assert_eq!(derived[0], derived[1]);
+    }
+
+    /// A block-quantized `attn_k_b` reaches the Component dequantized, each
+    /// head transposed back.
+    #[test]
+    fn a_quantized_split_key_projection_is_transposed_back_in_f32() {
+        let (nope, heads, latent) = (32u64, 2u64, 2u64);
+        let (file, _) = deepseek2_gguf(nope, KeyValueUp::SplitQ8);
+        let result = ingest_bytes(file);
+        // Stored row `h * latent + l` is `q8_block((h * latent + l) * 32)`:
+        // 0.5 times its quants.
+        let stored =
+            |head: u64, l: u64, j: u64| 0.5 * f32::from(((head * latent + l) * 32 + j) as u8 as i8);
+        let expected: Vec<f32> = (0..latent)
+            .flat_map(|l| (0..heads * nope).map(move |column| (l, column)))
+            .map(|(l, column)| stored(column / nope, l, column % nope))
+            .collect();
+        for layer in 0..2 {
+            let (shape, values) =
+                read_f32(&result, &format!("layers.{layer}.self_attn.k_nope_proj"));
+            assert_eq!(shape, vec![latent, heads * nope]);
+            assert_eq!(values, expected, "layer {layer}");
+        }
     }
 }
