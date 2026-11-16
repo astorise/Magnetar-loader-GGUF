@@ -24,6 +24,7 @@
 
 mod config;
 mod derived_lm_head;
+mod layered_tensors;
 mod naming;
 mod quant_blocks;
 mod rope_rows;
@@ -216,6 +217,11 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
         // change's design.md for the sourced research) -- the Component
         // expects `[in_features, out_features]` instead; see
         // `weight_layout.rs`.
+        // A layered file's packed per-layer tables and routed experts, cut
+        // into the tensors its Component requests (`layered_tensors.rs`),
+        // still in `[out, in]` orientation.
+        let payload_source =
+            layered_tensors::derive(&mut tensors, payload_source, &architecture_config)?;
         let payload_source = rope_rows::RopeRowRestoringPayloadSource::new(
             payload_source,
             &mut tensors,
@@ -636,7 +642,17 @@ mod tests {
     /// with 4-wide heads, half of each rotated (`rope_freqs` `[1, 1e30]`),
     /// and no `attn_v`.
     fn tiny_gemma4_gguf() -> Vec<u8> {
-        let kvs = vec![
+        gemma4_gguf(0, Vec::new(), Vec::new())
+    }
+
+    /// [`tiny_gemma4_gguf`] with per-layer inputs `per_layer_width` wide,
+    /// and `extra_kvs` and `extra_tensors` added.
+    fn gemma4_gguf(
+        per_layer_width: u32,
+        extra_kvs: Vec<Vec<u8>>,
+        extra_tensors: Vec<TestTensor>,
+    ) -> Vec<u8> {
+        let mut kvs = vec![
             kv_string("general.architecture", "gemma4"),
             kv_string("general.name", "tiny-gemma4-test"),
             kv_uint32("gemma4.embedding_length", 2),
@@ -653,7 +669,7 @@ mod tests {
             kv_uint32("gemma4.attention.value_length_swa", 2),
             kv_uint32("gemma4.attention.sliding_window", 8),
             kv_uint32("gemma4.attention.shared_kv_layers", 0),
-            kv_uint32("gemma4.embedding_length_per_layer_input", 0),
+            kv_uint32("gemma4.embedding_length_per_layer_input", per_layer_width),
             kv_float32("gemma4.final_logit_softcapping", 30.0),
             kv_array(
                 "gemma4.attention.sliding_window_pattern",
@@ -712,7 +728,166 @@ mod tests {
                 tensors.push(tensor(name("attn_v"), vec![2, head]));
             }
         }
+        kvs.extend(extra_kvs);
+        tensors.extend(extra_tensors);
         build_gguf(&kvs, &tensors, 32)
+    }
+
+    /// A `Q8_0` block: scale 0.5 and quants `seed, seed + 1, ...`.
+    fn q8_block(seed: u8) -> Vec<u8> {
+        let mut block = 0x3800u16.to_le_bytes().to_vec();
+        block.extend((0..32).map(|index| seed.wrapping_add(index)));
+        block
+    }
+
+    /// `load-layered-checkpoint-tensors`: a `gemma4` file's packed
+    /// per-layer tables are cut per layer (a `Q8_0` table on its block
+    /// boundaries), its fused expert projections split and stacked, and
+    /// its router scale folded, through the whole ingest.
+    #[test]
+    fn slices_per_layer_tables_and_restacks_experts_of_a_gemma4_file() {
+        let values = |count: u64| (0..count).map(|i| i as f32 * 0.1 + 0.5).collect::<Vec<_>>();
+        let float = |name: &'static str, dimensions: Vec<u64>| TestTensor {
+            name,
+            data: f32_bytes(&values(dimensions.iter().product())),
+            dimensions,
+            ggml_type: 0,
+        };
+        // 4 tokens, 2 layers of 32 per-layer input values, hidden 2;
+        // 2 experts of width 2.
+        let mut tensors = vec![
+            TestTensor {
+                name: "per_layer_token_embd.weight",
+                dimensions: vec![64, 4],
+                ggml_type: 8,
+                data: (0..4u8)
+                    .flat_map(|token| {
+                        (0..2u8).flat_map(move |layer| q8_block(token * 16 + layer * 8))
+                    })
+                    .collect(),
+            },
+            float("per_layer_model_proj.weight", vec![2, 64]),
+        ];
+        for layer in 0..2 {
+            let name = |field: &str| -> &'static str {
+                Box::leak(format!("blk.{layer}.{field}").into_boxed_str())
+            };
+            tensors.extend([
+                float(name("ffn_gate_up_exps.weight"), vec![2, 4, 2]),
+                float(name("ffn_down_exps.weight"), vec![2, 2, 2]),
+                float(name("ffn_gate_inp.weight"), vec![2, 2]),
+                float(name("ffn_gate_inp.scale"), vec![2]),
+                float(name("ffn_down_exps.scale"), vec![2]),
+            ]);
+        }
+        let file = gemma4_gguf(
+            32,
+            vec![
+                kv_uint32("gemma4.expert_count", 2),
+                kv_uint32("gemma4.expert_used_count", 1),
+                kv_uint32("gemma4.expert_feed_forward_length", 2),
+            ],
+            tensors,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(GGUF_FILE_NAME), file).unwrap();
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let result = GgufIngestor::new().ingest(&source).expect("bundle ingests");
+        let config = result.manifest.architecture_config.clone().unwrap();
+        assert_eq!(config.per_layer_input_size, Some(32));
+        let read = |name: &str| {
+            let tensor = result
+                .manifest
+                .tensors
+                .iter()
+                .find(|tensor| tensor.name == name)
+                .unwrap_or_else(|| panic!("no tensor '{name}'"));
+            let bytes = result
+                .payload_source
+                .read_payload(
+                    &magnetar_runtime::production_model_ingestion::ProductionPayloadRange {
+                        identity: tensor.name.clone(),
+                        offset: tensor.offset_bytes.unwrap(),
+                        length: tensor.size_bytes.unwrap(),
+                        digest: tensor.digest.clone(),
+                    },
+                )
+                .unwrap();
+            (tensor.clone(), bytes)
+        };
+        let as_f32 = |bytes: Vec<u8>| -> Vec<f32> {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
+                .collect()
+        };
+        assert!(
+            !result
+                .manifest
+                .tensors
+                .iter()
+                .any(|tensor| tensor.name.contains("packed."))
+        );
+
+        // Layer 1's embedding is each row's second `Q8_0` block, copied.
+        let (tensor, bytes) = read("layers.1.per_layer_embedding");
+        assert_eq!(tensor.shape, vec![4, 32]);
+        assert_eq!(
+            tensor.storage_dtype,
+            magnetar_runtime::model::ModelDType::Q8
+        );
+        let expected: Vec<u8> = (0..4u8)
+            .flat_map(|token| q8_block(token * 16 + 8))
+            .collect();
+        assert_eq!(bytes, expected);
+
+        // `[hidden, width]`: element (h, p) is stored row `32 + p`.
+        let table = &values(128);
+        let (tensor, bytes) = read("layers.1.per_layer_model_projection");
+        assert_eq!(tensor.shape, vec![2, 32]);
+        let expected: Vec<f32> = (0..2)
+            .flat_map(|h| (0..32).map(move |p| table[(32 + p) * 2 + h]))
+            .collect();
+        assert_eq!(as_f32(bytes), expected);
+
+        // Stacked experts: (h, e * 2 + i) is expert e's gate row i (up row
+        // 2 + i); down (i, e * 2 + h) is expert e's output h.
+        let gate_up = values(16);
+        for (name, first_row) in [("experts_gate_proj", 0), ("experts_up_proj", 2)] {
+            let (tensor, bytes) = read(&format!("layers.1.moe.{name}"));
+            assert_eq!(tensor.shape, vec![2, 4], "{name}");
+            let expected: Vec<f32> = (0..2)
+                .flat_map(|h| (0..4).map(move |column| (h, column)))
+                .map(|(h, column)| gate_up[((column / 2) * 4 + first_row + column % 2) * 2 + h])
+                .collect();
+            assert_eq!(as_f32(bytes), expected, "{name}");
+        }
+        let down = &values(8);
+        let (tensor, bytes) = read("layers.1.moe.experts_down_proj");
+        assert_eq!(tensor.shape, vec![2, 4]);
+        let expected: Vec<f32> = (0..2)
+            .flat_map(|i| (0..4).map(move |column| down[column * 2 + i]))
+            .collect();
+        assert_eq!(as_f32(bytes), expected);
+
+        // The router, `[hidden, experts]`, with `scale[h] / sqrt(hidden)`.
+        let router = &values(4);
+        let scale = &values(2);
+        let (tensor, bytes) = read("layers.1.moe.router_proj");
+        assert_eq!(tensor.shape, vec![2, 2]);
+        let factor = 2f32.powf(-0.5);
+        let expected: Vec<f32> = (0..2)
+            .flat_map(|h| (0..2).map(move |e| router[e * 2 + h] * scale[h] * factor))
+            .collect();
+        assert_eq!(as_f32(bytes), expected);
+        let (tensor, bytes) = read("layers.1.moe.per_expert_scale");
+        assert_eq!(tensor.shape, vec![2]);
+        assert_eq!(as_f32(bytes), values(2));
     }
 
     /// `per-layer-kv-geometry`: a `gemma4` file ingests with its layers'

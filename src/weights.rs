@@ -14,7 +14,7 @@
 //! transposed storage instead (`weight_layout.rs`).
 
 use crate::quant_blocks;
-use magnetar_runtime::model::{ModelDType, ModelTensorMetadata};
+use magnetar_runtime::model::ModelTensorMetadata;
 use magnetar_runtime::production_model_ingestion::{
     ProductionArtifactPayloadSource, ProductionIngestionError, ProductionModelSource,
     ProductionPayloadRange,
@@ -104,6 +104,52 @@ impl ProductionArtifactPayloadSource for GgufPayloadSource {
             })?;
         }
         Ok(raw)
+    }
+}
+
+impl GgufPayloadSource {
+    /// The stored byte length of tensor `identity`.
+    pub(crate) fn tensor_length(&self, identity: &str) -> Result<u64, ProductionIngestionError> {
+        self.locations
+            .get(identity)
+            .map(|location| location.file_length)
+            .ok_or_else(|| ProductionIngestionError::PayloadOutOfBounds {
+                identity: identity.to_string(),
+            })
+    }
+
+    /// Reads `length` bytes at `offset` within the stored tensor
+    /// `identity`, for tensors derived from part of a stored one
+    /// (`layered_tensors.rs`).
+    pub(crate) fn read_within(
+        &self,
+        identity: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, ProductionIngestionError> {
+        let out_of_bounds = || ProductionIngestionError::PayloadOutOfBounds {
+            identity: identity.to_string(),
+        };
+        let location = self.locations.get(identity).ok_or_else(out_of_bounds)?;
+        if offset
+            .checked_add(length)
+            .is_none_or(|end| end > location.file_length)
+        {
+            return Err(out_of_bounds());
+        }
+        let start = self
+            .tensor_data_start
+            .checked_add(location.file_offset)
+            .and_then(|start| start.checked_add(offset))
+            .ok_or_else(out_of_bounds)?;
+        let unavailable = |error: std::io::Error| ProductionIngestionError::PayloadUnavailable {
+            identity: format!("{identity}: {error}"),
+        };
+        let mut file = fs::File::open(&self.path).map_err(unavailable)?;
+        file.seek(SeekFrom::Start(start)).map_err(unavailable)?;
+        let mut buffer = vec![0u8; usize::try_from(length).map_err(|_| out_of_bounds())?];
+        file.read_exact(&mut buffer).map_err(unavailable)?;
+        Ok(buffer)
     }
 }
 
@@ -231,21 +277,7 @@ pub fn discover_and_parse_weights(
         // A block-quantized tensor keeps its storage dtype and original
         // bytes (`execute-direct-quantized-weights`); its element count
         // must still be a whole number of its format's blocks.
-        if let Some(block_elements) = match tensor.storage_dtype {
-            ModelDType::Q8 | ModelDType::Iq4Nl => Some(quant_blocks::Q8_0_BLOCK_ELEMENTS),
-            ModelDType::Q2K
-            | ModelDType::Q3K
-            | ModelDType::Iq4Xs
-            | ModelDType::Iq2Xxs
-            | ModelDType::Iq2Xs
-            | ModelDType::Iq2S
-            | ModelDType::Iq3Xxs
-            | ModelDType::Iq3S
-            | ModelDType::Q4K
-            | ModelDType::Q5K
-            | ModelDType::Q6K => Some(quant_blocks::QK_BLOCK_ELEMENTS),
-            _ => None,
-        } {
+        if let Some(block_elements) = quant_blocks::block_elements(tensor.storage_dtype) {
             let elements = element_count(&tensor.shape)?;
             if !elements.is_multiple_of(block_elements) {
                 return Err(ProductionIngestionError::MalformedMetadata {
@@ -311,6 +343,7 @@ pub fn discover_and_parse_weights(
 mod tests {
     use super::*;
     use magnetar_runtime::ModelArtifactSource;
+    use magnetar_runtime::model::ModelDType;
 
     /// Builds a minimal, real, valid GGUF byte blob for tests -- mirrors
     /// `magnetar-format-gguf`'s own test-only `build_gguf` helper (a
