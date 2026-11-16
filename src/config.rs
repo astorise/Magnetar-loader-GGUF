@@ -13,7 +13,11 @@
 //! schema.
 
 use magnetar_format_gguf::GgufMetadataValue;
-use magnetar_runtime::model::{LayerSpec, ModelArchitectureConfig};
+use magnetar_runtime::model::{
+    ExpertGroupScore, ExpertGroups, ExpertRoutingConfig, ExpertScoring, LatentAttentionConfig,
+    LayerSpec, ModelArchitectureConfig, RopeFrequencyScaling,
+};
+use magnetar_runtime::operator::RopeYarnFrequencyScaling;
 use magnetar_runtime::production_model_ingestion::ProductionIngestionError;
 use std::collections::BTreeMap;
 
@@ -22,8 +26,11 @@ use std::collections::BTreeMap;
 /// converter stores the attention projections (see
 /// [`rope_rows_interleaved`]) and, for `qwen2moe`, in a routed
 /// mixture-of-experts MLP ([`mixture_of_experts`]); `gemma4` declares its
-/// layers' differing geometry ([`layer_layout`]).
-pub const SUPPORTED_ARCHITECTURES: [&str; 4] = ["qwen2", "llama", "qwen2moe", "gemma4"];
+/// layers' differing geometry ([`layer_layout`]); `deepseek2` attends through
+/// a compressed latent ([`latent_attention`]) and routes experts its own way
+/// ([`expert_layers_and_routing`]).
+pub const SUPPORTED_ARCHITECTURES: [&str; 5] =
+    ["qwen2", "llama", "qwen2moe", "gemma4", "deepseek2"];
 
 /// Whether llama.cpp's converter permuted `architecture`'s query and key
 /// projection rows for its interleaved-pair RoPE: it does for `llama`
@@ -131,6 +138,41 @@ pub fn mixture_of_experts(
             normalize_top_k: true,
         }));
     }
+    if architecture == "deepseek2" {
+        // Routed experts after the leading dense layers, each as wide as
+        // the declared expert width, and `expert_shared_count` ungated
+        // shared experts summed into one of their combined width. A file
+        // without routed experts is dense.
+        let Some(experts) = uint_value(metadata, &key("expert_count")).filter(|count| *count > 0)
+        else {
+            return Ok(None);
+        };
+        let narrow = |value: u64, name: &str| {
+            u32::try_from(value)
+                .map_err(|_| malformed(format!("GGUF metadata's {name} does not fit in a u32")))
+        };
+        let width =
+            uint_or_first(metadata, &key("expert_feed_forward_length")).ok_or_else(|| {
+                malformed(format!(
+                    "GGUF metadata is missing required key '{}'",
+                    key("expert_feed_forward_length")
+                ))
+            })?;
+        let shared = uint_value(metadata, &key("expert_shared_count")).unwrap_or(0);
+        return Ok(Some(magnetar_runtime::model::MixtureOfExpertsConfig {
+            experts: narrow(experts, "expert_count")?,
+            experts_per_token: narrow(
+                required_uint(metadata, &key("expert_used_count"))?,
+                "expert_used_count",
+            )?,
+            expert_intermediate_size: width,
+            shared_expert_intermediate_size: (shared > 0).then_some(shared * width),
+            normalize_top_k: matches!(
+                metadata.get(&key("expert_weights_norm")),
+                Some(GgufMetadataValue::Bool(true))
+            ),
+        }));
+    }
     if architecture != "qwen2moe" {
         return Ok(None);
     }
@@ -160,6 +202,180 @@ pub fn mixture_of_experts(
         shared_expert_intermediate_size,
         normalize_top_k: false,
     }))
+}
+
+/// Multi-head latent attention, when a `deepseek2` file declares
+/// `attention.kv_lora_rank` (`express-latent-attention-forms`). llama.cpp's
+/// converter writes the expanded head widths as `attention.key_length` and
+/// `value_length` in files from before it split `attn_kv_b`, and as
+/// `key_length_mla` and `value_length_mla` (beside the latent's own widths
+/// in `key_length` and `value_length`) after; the rotated width is
+/// `rope.dimension_count`.
+pub fn latent_attention(
+    metadata: &BTreeMap<String, GgufMetadataValue>,
+    architecture: &str,
+) -> Result<Option<LatentAttentionConfig>, ProductionIngestionError> {
+    let key = |name: &str| format!("{architecture}.{name}");
+    if architecture != "deepseek2" {
+        return Ok(None);
+    }
+    let Some(kv_lora_rank) = uint_value(metadata, &key("attention.kv_lora_rank")) else {
+        return Ok(None);
+    };
+    let field = |mla: &str, legacy: &str| {
+        uint_value(metadata, &key(mla))
+            .or_else(|| uint_value(metadata, &key(legacy)))
+            .ok_or_else(|| {
+                malformed(format!(
+                    "GGUF metadata declares a kv_lora_rank but neither '{}' nor '{}'",
+                    key(mla),
+                    key(legacy)
+                ))
+            })
+    };
+    let key_width = field("attention.key_length_mla", "attention.key_length")?;
+    let v_head_dim = field("attention.value_length_mla", "attention.value_length")?;
+    let qk_rope_head_dim = required_uint(metadata, &key("rope.dimension_count"))?;
+    let qk_nope_head_dim = key_width.checked_sub(qk_rope_head_dim).ok_or_else(|| {
+        malformed(format!(
+            "GGUF metadata's {key_width}-wide key heads are narrower than their \
+             {qk_rope_head_dim} rotated dimensions"
+        ))
+    })?;
+    let rank = |value: u64, name: &str| {
+        u32::try_from(value)
+            .map_err(|_| malformed(format!("GGUF metadata's {name} does not fit in a u32")))
+    };
+    Ok(Some(LatentAttentionConfig {
+        q_lora_rank: uint_value(metadata, &key("attention.q_lora_rank"))
+            .map(|value| rank(value, "q_lora_rank"))
+            .transpose()?,
+        kv_lora_rank: rank(kv_lora_rank, "kv_lora_rank")?,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
+    }))
+}
+
+/// A `deepseek2` file's YaRN rotary scaling (`rope.scaling.type` `yarn`),
+/// as llama.cpp applies it: the correction range from `yarn_beta_fast`
+/// and `yarn_beta_slow` (32 and 1 when absent) rounded outwards, cosines
+/// and sines left unscaled, and the softmax scaled by the square of
+/// `1 + 0.1 * m * ln(factor)`, where the converter stores `0.1 * m` as
+/// `yarn_log_multiplier` (`m` is the checkpoint's `mscale_all_dim`). The
+/// Hugging Face form scales the cosines and sines by
+/// `mscale(factor, mscale) / mscale(factor, mscale_all_dim)`, which is `1`
+/// for the published DeepSeek V2 and V3 configurations (`mscale` equals
+/// `mscale_all_dim`); the file does not record `mscale`.
+pub fn yarn_scaling(
+    metadata: &BTreeMap<String, GgufMetadataValue>,
+    architecture: &str,
+) -> Result<Option<RopeFrequencyScaling>, ProductionIngestionError> {
+    let key = |name: &str| format!("{architecture}.{name}");
+    if architecture != "deepseek2"
+        || string_value(metadata, &key("rope.scaling.type")) != Some("yarn")
+    {
+        return Ok(None);
+    }
+    let required = |name: &str| {
+        float_value(metadata, &key(name)).ok_or_else(|| {
+            malformed(format!(
+                "GGUF metadata's yarn scaling has no '{}'",
+                key(name)
+            ))
+        })
+    };
+    let scaling = RopeYarnFrequencyScaling {
+        factor: required("rope.scaling.factor")?,
+        original_context_length: required_uint(
+            metadata,
+            &key("rope.scaling.original_context_length"),
+        )?,
+        beta_fast: float_value(metadata, &key("rope.scaling.yarn_beta_fast")).unwrap_or(32.0),
+        beta_slow: float_value(metadata, &key("rope.scaling.yarn_beta_slow")).unwrap_or(1.0),
+        attention_factor: 1.0,
+        truncate: true,
+    };
+    scaling.validate().map_err(malformed)?;
+    Ok(Some(RopeFrequencyScaling::Yarn {
+        scaling,
+        mscale_all_dim: float_value(metadata, &key("rope.scaling.yarn_log_multiplier"))
+            .filter(|multiplier| *multiplier != 0.0)
+            .map(|multiplier| multiplier / 0.1),
+    }))
+}
+
+/// Which layers of a `deepseek2` file route experts, and how
+/// (`express-latent-attention-forms`):
+/// - the first `leading_dense_block_count` layers are dense;
+/// - `expert_gating_func` scores the experts by softmax (`1`, or absent, as
+///   llama.cpp assumes for DeepSeek V2 files) or sigmoid (`2`);
+/// - `expert_group_count` groups of which `expert_group_used_count` are
+///   kept, each scored by its best expert after a softmax and by its two
+///   best after a sigmoid, as the checkpoints' own routing does (llama.cpp
+///   sums the two best in both cases);
+/// - the chosen weights are multiplied by `expert_weights_scale`;
+/// - a selection-only bias per expert when the file stores
+///   `exp_probs_b` (`has_selection_bias`);
+/// - the shared experts are ungated.
+pub fn expert_layers_and_routing(
+    metadata: &BTreeMap<String, GgufMetadataValue>,
+    architecture: &str,
+    config: &ModelArchitectureConfig,
+    has_selection_bias: bool,
+) -> Result<(Option<Vec<bool>>, Option<ExpertRoutingConfig>), ProductionIngestionError> {
+    let key = |name: &str| format!("{architecture}.{name}");
+    if architecture != "deepseek2" || config.mixture_of_experts.is_none() {
+        return Ok((None, None));
+    }
+    let layers = config.num_hidden_layers as usize;
+    let dense = uint_value(metadata, &key("leading_dense_block_count")).unwrap_or(0) as usize;
+    if dense >= layers {
+        return Err(malformed(format!(
+            "GGUF metadata declares routed experts, but all {layers} layers are dense"
+        )));
+    }
+    let moe_layers = (dense > 0).then(|| (0..layers).map(|layer| layer >= dense).collect());
+    let scoring = match uint_value(metadata, &key("expert_gating_func")) {
+        None | Some(1) => ExpertScoring::Softmax,
+        Some(2) => ExpertScoring::Sigmoid,
+        Some(other) => {
+            return Err(ProductionIngestionError::UnsupportedFormat {
+                reason: format!("GGUF metadata's expert_gating_func {other} is not supported"),
+            });
+        }
+    };
+    let groups = match uint_value(metadata, &key("expert_group_count")) {
+        Some(count) if count > 1 => {
+            let narrow = |value: u64, name: &str| {
+                u32::try_from(value)
+                    .map_err(|_| malformed(format!("GGUF metadata's {name} does not fit in a u32")))
+            };
+            Some(ExpertGroups {
+                count: narrow(count, "expert_group_count")?,
+                per_token: narrow(
+                    required_uint(metadata, &key("expert_group_used_count"))?,
+                    "expert_group_used_count",
+                )?,
+                score: match scoring {
+                    ExpertScoring::Softmax => ExpertGroupScore::Max,
+                    ExpertScoring::Sigmoid => ExpertGroupScore::TopTwoSum,
+                },
+            })
+        }
+        _ => None,
+    };
+    Ok((
+        moe_layers,
+        Some(ExpertRoutingConfig {
+            scoring,
+            groups,
+            routed_scaling_factor: float_value(metadata, &key("expert_weights_scale"))
+                .unwrap_or(1.0),
+            selection_bias: has_selection_bias,
+            shared_expert_gated: false,
+        }),
+    ))
 }
 
 /// `general.architecture`, when it is one this loader reads.
@@ -228,6 +444,15 @@ pub fn normalize(
              intermediate_size/vocab_size",
         ));
     }
+    // Latent attention expands one K/V head per query head, each
+    // `qk_nope + qk_rope` wide (`latent_attention`), whatever the file's
+    // MQA-form `head_count_kv` and `key_length` say.
+    let latent = latent_attention(metadata, architecture)?;
+    let num_key_value_heads = if latent.is_some() {
+        num_attention_heads
+    } else {
+        num_key_value_heads
+    };
     if num_hidden_layers == 0 || num_attention_heads == 0 || num_key_value_heads == 0 {
         return Err(malformed(
             "GGUF metadata declares a zero-valued layer/head count",
@@ -242,7 +467,9 @@ pub fn normalize(
 
     // A sliding-window layer's head width when the file declares one apart
     // (`key_length_swa`): the architecture-wide width of a layered file.
-    let head_dim = match uint_value(metadata, &key("attention.key_length_swa"))
+    let head_dim = match latent
+        .map(|mla| mla.qk_nope_head_dim + mla.qk_rope_head_dim)
+        .or_else(|| uint_value(metadata, &key("attention.key_length_swa")))
         .or_else(|| uint_value(metadata, &key("attention.key_length")))
     {
         Some(declared) => declared,
@@ -272,6 +499,7 @@ pub fn normalize(
         return Err(malformed("GGUF metadata's rope.freq_base must be positive"));
     }
 
+    let rope_frequency_scaling = yarn_scaling(metadata, architecture)?;
     let architecture_config = ModelArchitectureConfig {
         hidden_size,
         intermediate_size,
@@ -282,11 +510,15 @@ pub fn normalize(
         vocab_size,
         rms_norm_eps,
         rope_theta,
-        rope_scaling_factor: float_value(metadata, &key("rope.scaling.factor"))
-            .map(|value| value as f32),
+        rope_scaling_factor: if rope_frequency_scaling.is_some() {
+            None
+        } else {
+            float_value(metadata, &key("rope.scaling.factor")).map(|value| value as f32)
+        },
         // A per-frequency RoPE scaling is stored as a `rope_freqs` tensor,
-        // which `lib.rs` rejects.
-        rope_frequency_scaling: None,
+        // which `lib.rs` rejects; YaRN is declared by keys.
+        rope_frequency_scaling,
+        latent_attention: latent,
         // Patched to real tensor-derived evidence by the caller; see this
         // function's own doc comment.
         tie_word_embeddings: false,
@@ -828,5 +1060,202 @@ mod gemma4_tests {
             layer_layout(&metadata, "qwen2", &base, |_| true, None).unwrap(),
             None
         );
+    }
+}
+
+/// `express-latent-attention-forms`: the metadata of llama.cpp's
+/// `deepseek2` files.
+#[cfg(test)]
+mod deepseek2_tests {
+    use super::*;
+    use GgufMetadataValue::{Float32, String as Text, UInt32};
+
+    /// The metadata of `DeepSeek-V2-Lite-Chat.Q4_K_M.gguf`
+    /// (mradermacher, converted in 2024, before llama.cpp split
+    /// `attn_kv_b`), as read from the file's header.
+    fn v2_lite() -> BTreeMap<String, GgufMetadataValue> {
+        let mut metadata =
+            BTreeMap::from([("general.architecture".to_string(), Text("deepseek2".into()))]);
+        for (key, value) in [
+            ("block_count", UInt32(27)),
+            ("context_length", UInt32(163_840)),
+            ("embedding_length", UInt32(2048)),
+            ("feed_forward_length", UInt32(10_944)),
+            ("attention.head_count", UInt32(16)),
+            ("attention.head_count_kv", UInt32(16)),
+            ("rope.freq_base", Float32(10_000.0)),
+            ("attention.layer_norm_rms_epsilon", Float32(1e-6)),
+            ("expert_used_count", UInt32(6)),
+            ("leading_dense_block_count", UInt32(1)),
+            ("vocab_size", UInt32(102_400)),
+            ("attention.kv_lora_rank", UInt32(512)),
+            ("attention.key_length", UInt32(192)),
+            ("attention.value_length", UInt32(128)),
+            ("expert_feed_forward_length", UInt32(1408)),
+            ("expert_count", UInt32(64)),
+            ("expert_shared_count", UInt32(2)),
+            ("expert_weights_scale", Float32(1.0)),
+            ("rope.dimension_count", UInt32(64)),
+            ("rope.scaling.type", Text("yarn".into())),
+            ("rope.scaling.factor", Float32(40.0)),
+            ("rope.scaling.original_context_length", UInt32(4096)),
+            ("rope.scaling.yarn_log_multiplier", Float32(0.0707)),
+        ] {
+            metadata.insert(format!("deepseek2.{key}"), value);
+        }
+        metadata
+    }
+
+    fn routing(
+        metadata: &BTreeMap<String, GgufMetadataValue>,
+        selection_bias: bool,
+    ) -> Result<(Option<Vec<bool>>, Option<ExpertRoutingConfig>), ProductionIngestionError> {
+        let mut config = normalize(metadata, 102_400)?;
+        config.mixture_of_experts = mixture_of_experts(metadata, "deepseek2", |_| None)?;
+        expert_layers_and_routing(metadata, "deepseek2", &config, selection_bias)
+    }
+
+    #[test]
+    fn a_v2_lite_file_declares_latent_attention_yarn_and_its_expert_layers() {
+        let metadata = v2_lite();
+        let config = normalize(&metadata, 102_400).unwrap();
+        assert_eq!(
+            config.latent_attention,
+            Some(LatentAttentionConfig {
+                q_lora_rank: None,
+                kv_lora_rank: 512,
+                qk_nope_head_dim: 128,
+                qk_rope_head_dim: 64,
+                v_head_dim: 128,
+            })
+        );
+        assert_eq!((config.head_dim, config.num_key_value_heads), (192, 16));
+        assert_eq!(config.rope_scaling_factor, None);
+        let Some(RopeFrequencyScaling::Yarn {
+            scaling,
+            mscale_all_dim,
+        }) = config.rope_frequency_scaling
+        else {
+            panic!("no YaRN: {:?}", config.rope_frequency_scaling);
+        };
+        assert_eq!(
+            (scaling.factor, scaling.original_context_length),
+            (40.0, 4096)
+        );
+        assert_eq!((scaling.beta_fast, scaling.beta_slow), (32.0, 1.0));
+        assert_eq!((scaling.attention_factor, scaling.truncate), (1.0, true));
+        // `0.1 * 0.707` stored in `f32`.
+        assert!((mscale_all_dim.unwrap() - 0.707).abs() < 1e-6);
+        assert_eq!(
+            mixture_of_experts(&metadata, "deepseek2", |_| None).unwrap(),
+            Some(magnetar_runtime::model::MixtureOfExpertsConfig {
+                experts: 64,
+                experts_per_token: 6,
+                expert_intermediate_size: 1408,
+                shared_expert_intermediate_size: Some(2816),
+                normalize_top_k: false,
+            })
+        );
+        let (layers, routing) = routing(&metadata, false).unwrap();
+        let layers = layers.unwrap();
+        assert_eq!(layers.len(), 27);
+        assert!(!layers[0] && layers[1..].iter().all(|routed| *routed));
+        assert_eq!(
+            routing,
+            Some(ExpertRoutingConfig {
+                scoring: ExpertScoring::Softmax,
+                groups: None,
+                routed_scaling_factor: 1.0,
+                selection_bias: false,
+                shared_expert_gated: false,
+            })
+        );
+    }
+
+    /// A file converted after llama.cpp split `attn_kv_b` declares the MQA
+    /// form's widths beside the expanded ones.
+    #[test]
+    fn a_split_key_value_file_reads_the_expanded_head_widths() {
+        let mut metadata = v2_lite();
+        for (key, value) in [
+            ("attention.head_count_kv", 1),
+            ("attention.key_length", 576),
+            ("attention.value_length", 512),
+            ("attention.key_length_mla", 192),
+            ("attention.value_length_mla", 128),
+        ] {
+            metadata.insert(format!("deepseek2.{key}"), UInt32(value));
+        }
+        let split = normalize(&metadata, 102_400).unwrap();
+        let fused = normalize(&v2_lite(), 102_400).unwrap();
+        assert_eq!(split.latent_attention, fused.latent_attention);
+        assert_eq!((split.head_dim, split.num_key_value_heads), (192, 16));
+    }
+
+    /// A sigmoid router with groups scores each group by its two best
+    /// experts; a softmax router by its best.
+    #[test]
+    fn grouped_routers_score_groups_like_their_checkpoints() {
+        let mut metadata = v2_lite();
+        for (key, value) in [
+            ("expert_count", UInt32(256)),
+            ("expert_used_count", UInt32(8)),
+            ("expert_group_count", UInt32(8)),
+            ("expert_group_used_count", UInt32(4)),
+            ("expert_gating_func", UInt32(2)),
+            ("expert_weights_scale", Float32(2.5)),
+        ] {
+            metadata.insert(format!("deepseek2.{key}"), value);
+        }
+        metadata.insert(
+            "deepseek2.expert_weights_norm".into(),
+            GgufMetadataValue::Bool(true),
+        );
+        let routing_of = |metadata: &BTreeMap<_, _>| routing(metadata, true).unwrap().1.unwrap();
+        let sigmoid = routing_of(&metadata);
+        assert_eq!(sigmoid.scoring, ExpertScoring::Sigmoid);
+        assert_eq!(
+            sigmoid.groups,
+            Some(ExpertGroups {
+                count: 8,
+                per_token: 4,
+                score: ExpertGroupScore::TopTwoSum,
+            })
+        );
+        assert_eq!(sigmoid.routed_scaling_factor, 2.5);
+        assert!(sigmoid.selection_bias);
+        assert!(
+            mixture_of_experts(&metadata, "deepseek2", |_| None)
+                .unwrap()
+                .unwrap()
+                .normalize_top_k
+        );
+        metadata.insert("deepseek2.expert_gating_func".into(), UInt32(1));
+        assert_eq!(
+            routing_of(&metadata).groups.unwrap().score,
+            ExpertGroupScore::Max
+        );
+        metadata.insert("deepseek2.expert_gating_func".into(), UInt32(3));
+        assert!(matches!(
+            routing(&metadata, true),
+            Err(ProductionIngestionError::UnsupportedFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn incomplete_latent_attention_or_yarn_metadata_is_refused() {
+        let mut metadata = v2_lite();
+        metadata.remove("deepseek2.rope.dimension_count");
+        assert!(normalize(&metadata, 102_400).is_err());
+        let mut metadata = v2_lite();
+        metadata.remove("deepseek2.rope.scaling.original_context_length");
+        assert!(normalize(&metadata, 102_400).is_err());
+        let mut metadata = v2_lite();
+        metadata.insert("deepseek2.attention.key_length".into(), UInt32(32));
+        assert!(normalize(&metadata, 102_400).is_err());
+        // Every layer dense, yet routed experts declared.
+        let mut metadata = v2_lite();
+        metadata.insert("deepseek2.leading_dense_block_count".into(), UInt32(27));
+        assert!(routing(&metadata, false).is_err());
     }
 }

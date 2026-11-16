@@ -15,6 +15,21 @@
 //!   converter copies `router.scale` unchanged, and the router computes
 //!   `proj(norm(x) * scale * hidden^-0.5)`.
 //!
+//! A `deepseek2` file's latent-attention projections are split by rows
+//! (`express-latent-attention-forms`), as the Hugging Face loader splits
+//! the checkpoint's: `attn_q` (or `attn_q_b`) into `self_attn.q_nope_proj`
+//! and `self_attn.q_rope_proj`, each head's position-independent rows before
+//! its rotated rows; `attn_kv_a_mqa` into `self_attn.kv_a_proj` and
+//! `self_attn.k_rope_proj`, the latent's rows before the shared rotated
+//! key's; and `attn_kv_b` into `self_attn.k_nope_proj` and
+//! `self_attn.v_proj`, each head's key rows before its value rows. Files
+//! converted after llama.cpp split `attn_kv_b` store `attn_v_b`
+//! (`[heads, value, latent]`, the value rows already apart: the same bytes)
+//! and `attn_k_b` (`[heads, latent, key]`, each head's key rows
+//! transposed): its heads are transposed back, in the stored float type,
+//! or in `f32` from a block-quantized one, whose blocks run along the wrong
+//! dimension to be kept.
+//!
 //! Slices are taken in stored bytes: every cut falls on a row or, for a
 //! block-quantized table, on a block boundary, so block-quantized bytes are
 //! copied, never re-encoded. The derived tensors keep the `[out, in]`
@@ -39,6 +54,16 @@ pub(crate) const EXPERTS_GATE_UP: &str = "packed.experts_gate_up";
 pub(crate) const ROUTER_PROJECTION: &str = "packed.router_proj";
 /// A layer's `ffn_gate_inp.scale`, as discovered (after `layers.N.`).
 pub(crate) const ROUTER_SCALE: &str = "packed.router_scale";
+/// A latent-attention layer's `attn_q_b`, as discovered (after `layers.N.`).
+pub(crate) const QUERY_UP_PROJECTION: &str = "packed.q_b_proj";
+/// A latent-attention layer's `attn_kv_a_mqa`, as discovered.
+pub(crate) const LATENT_DOWN_PROJECTION: &str = "packed.kv_a_proj_with_mqa";
+/// A latent-attention layer's `attn_kv_b`, as discovered.
+pub(crate) const LATENT_UP_PROJECTION: &str = "packed.kv_b_proj";
+/// A latent-attention layer's `attn_k_b`, as discovered.
+pub(crate) const KEY_UP_PER_HEAD: &str = "packed.k_b_proj";
+/// A latent-attention layer's `attn_v_b`, as discovered.
+pub(crate) const VALUE_UP_PER_HEAD: &str = "packed.v_b_proj";
 
 /// How one derived tensor's bytes come from a stored one.
 #[derive(Debug)]
@@ -55,6 +80,16 @@ enum Derivation {
     Ranges {
         source: String,
         ranges: Vec<(u64, u64)>,
+    },
+    /// The `[heads, rows, columns]` source with each head transposed, as the
+    /// `[heads * columns, rows]` matrix: in `dtype` when it is a float type,
+    /// in `f32` otherwise.
+    HeadTranspose {
+        source: String,
+        dtype: ModelDType,
+        heads: u64,
+        rows: u64,
+        columns: u64,
     },
     /// The `[experts, hidden]` router projection with `scale[h] * factor`
     /// folded into its column `h`, as `f32`.
@@ -396,6 +431,7 @@ pub fn derive(
             size,
         ));
     }
+    derive_latent_attention(tensors, config, &mut derived, &mut added)?;
     if let Some(stray) = tensors
         .iter()
         .find(|tensor| tensor.name.contains("packed."))
@@ -407,6 +443,256 @@ pub fn derive(
     }
     tensors.extend(added);
     Ok(LayeredTensorSource { inner, derived })
+}
+
+/// The bytes of one element of a float `dtype`.
+fn float_bytes(dtype: ModelDType) -> Option<usize> {
+    match dtype {
+        ModelDType::F32 => Some(4),
+        ModelDType::F16 | ModelDType::Bf16 => Some(2),
+        _ => None,
+    }
+}
+
+/// `raw`, stored as block-quantized `dtype`, as `f32` values.
+fn dequantize(raw: &[u8], dtype: ModelDType) -> Option<Vec<f32>> {
+    use magnetar_runtime::quantization as q;
+    Some(match dtype {
+        ModelDType::Q8 => q::dequantize_q8_0(raw),
+        ModelDType::Q4 => q::dequantize_q4_0(raw),
+        ModelDType::Q4K => q::dequantize_q4_k(raw),
+        ModelDType::Q5K => q::dequantize_q5_k(raw),
+        ModelDType::Q6K => q::dequantize_q6_k(raw),
+        ModelDType::Q2K => q::dequantize_q2_k(raw),
+        ModelDType::Q3K => q::dequantize_q3_k(raw),
+        ModelDType::Iq4Nl => q::dequantize_iq4_nl(raw),
+        ModelDType::Iq4Xs => q::dequantize_iq4_xs(raw),
+        ModelDType::Iq2Xxs => q::dequantize_iq2_xxs(raw),
+        ModelDType::Iq2Xs => q::dequantize_iq2_xs(raw),
+        ModelDType::Iq2S => q::dequantize_iq2_s(raw),
+        ModelDType::Iq3Xxs => q::dequantize_iq3_xxs(raw),
+        ModelDType::Iq3S => q::dequantize_iq3_s(raw),
+        _ => return None,
+    })
+}
+
+/// `rows` of `stored`, by `(first row, row count)`, as the derived tensor
+/// `layers.{layer}.{name}`: a `[rows, in]` matrix of `stored`'s bytes.
+fn insert_rows(
+    derived: &mut BTreeMap<String, (Derivation, u64)>,
+    added: &mut Vec<ModelTensorMetadata>,
+    stored: &ModelTensorMetadata,
+    layer: &str,
+    name: &str,
+    rows: &[(u64, u64)],
+) -> Result<(), ProductionIngestionError> {
+    let [stored_rows, columns] = matrix(stored)?;
+    let row = row_bytes(stored, stored_rows, columns, columns)?;
+    let count: u64 = rows.iter().map(|(_, count)| count).sum();
+    let name = format!("layers.{layer}.{name}");
+    derived.insert(
+        name.clone(),
+        (
+            Derivation::Ranges {
+                source: stored.name.clone(),
+                ranges: rows
+                    .iter()
+                    .map(|(first, count)| (first * row, count * row))
+                    .collect(),
+            },
+            count * row,
+        ),
+    );
+    added.push(derived_tensor(
+        stored,
+        name,
+        vec![count, columns],
+        stored.storage_dtype,
+        count * row,
+    ));
+    Ok(())
+}
+
+/// Each head's `first` rows then its `second` rows, for `heads` heads: the
+/// `(first row, row count)` runs of either part.
+fn per_head_rows(heads: u64, first: u64, second: u64) -> [Vec<(u64, u64)>; 2] {
+    let stride = first + second;
+    [
+        (0..heads).map(|head| (head * stride, first)).collect(),
+        (0..heads)
+            .map(|head| (head * stride + first, second))
+            .collect(),
+    ]
+}
+
+/// Takes `layers.{layer}.{suffix}`, checked to be `shape`.
+fn take_shaped(
+    tensors: &mut Vec<ModelTensorMetadata>,
+    layer: &str,
+    suffix: &str,
+    shape: &[u64],
+) -> Result<ModelTensorMetadata, ProductionIngestionError> {
+    let name = format!("layers.{layer}.{suffix}");
+    let stored = take(tensors, &name)
+        .ok_or_else(|| malformed(format!("latent-attention layer {layer} has no '{name}'")))?;
+    if stored.shape != shape {
+        return Err(malformed(format!(
+            "'{name}' is {:?}, not {shape:?}",
+            stored.shape
+        )));
+    }
+    Ok(stored)
+}
+
+/// Splits each latent-attention layer's fused projections by rows, and
+/// transposes a split key projection's heads back (see the module
+/// documentation).
+fn derive_latent_attention(
+    tensors: &mut Vec<ModelTensorMetadata>,
+    config: &ModelArchitectureConfig,
+    derived: &mut BTreeMap<String, (Derivation, u64)>,
+    added: &mut Vec<ModelTensorMetadata>,
+) -> Result<(), ProductionIngestionError> {
+    let Some(mla) = &config.latent_attention else {
+        if let Some(layer) = layers_with(tensors, LATENT_DOWN_PROJECTION).first() {
+            return Err(malformed(format!(
+                "layer {layer} stores latent-attention projections, but the metadata \
+                 declares no kv_lora_rank"
+            )));
+        }
+        return Ok(());
+    };
+    let heads = u64::from(config.num_attention_heads);
+    let (nope, rope, value) = (mla.qk_nope_head_dim, mla.qk_rope_head_dim, mla.v_head_dim);
+    let latent = u64::from(mla.kv_lora_rank);
+    let hidden = config.hidden_size;
+    for layer in 0..u64::from(config.num_hidden_layers) {
+        let layer = layer.to_string();
+        let (query_name, query_input) = match mla.q_lora_rank {
+            Some(rank) => (QUERY_UP_PROJECTION, u64::from(rank)),
+            None => ("self_attn.q_proj", hidden),
+        };
+        let query = take_shaped(
+            tensors,
+            &layer,
+            query_name,
+            &[heads * (nope + rope), query_input],
+        )?;
+        let [query_nope, query_rope] = per_head_rows(heads, nope, rope);
+        insert_rows(
+            derived,
+            added,
+            &query,
+            &layer,
+            "self_attn.q_nope_proj",
+            &query_nope,
+        )?;
+        insert_rows(
+            derived,
+            added,
+            &query,
+            &layer,
+            "self_attn.q_rope_proj",
+            &query_rope,
+        )?;
+
+        let down = take_shaped(
+            tensors,
+            &layer,
+            LATENT_DOWN_PROJECTION,
+            &[latent + rope, hidden],
+        )?;
+        insert_rows(
+            derived,
+            added,
+            &down,
+            &layer,
+            "self_attn.kv_a_proj",
+            &[(0, latent)],
+        )?;
+        insert_rows(
+            derived,
+            added,
+            &down,
+            &layer,
+            "self_attn.k_rope_proj",
+            &[(latent, rope)],
+        )?;
+
+        if tensors
+            .iter()
+            .any(|tensor| tensor.name == format!("layers.{layer}.{LATENT_UP_PROJECTION}"))
+        {
+            let up = take_shaped(
+                tensors,
+                &layer,
+                LATENT_UP_PROJECTION,
+                &[heads * (nope + value), latent],
+            )?;
+            let [key_nope, values] = per_head_rows(heads, nope, value);
+            insert_rows(
+                derived,
+                added,
+                &up,
+                &layer,
+                "self_attn.k_nope_proj",
+                &key_nope,
+            )?;
+            insert_rows(derived, added, &up, &layer, "self_attn.v_proj", &values)?;
+            continue;
+        }
+        // `[heads, value, latent]`: already the `[heads * value, latent]`
+        // value projection's bytes.
+        let mut values = take_shaped(tensors, &layer, VALUE_UP_PER_HEAD, &[heads, value, latent])?;
+        values.shape = vec![heads * value, latent];
+        insert_rows(
+            derived,
+            added,
+            &values,
+            &layer,
+            "self_attn.v_proj",
+            &[(0, heads * value)],
+        )?;
+        let keys = take_shaped(tensors, &layer, KEY_UP_PER_HEAD, &[heads, latent, nope])?;
+        if float_bytes(keys.storage_dtype).is_none()
+            && dequantize(&[], keys.storage_dtype).is_none()
+        {
+            return Err(ProductionIngestionError::UnsupportedFormat {
+                reason: format!(
+                    "tensor '{}' is stored as {:?}, which transposing does not support",
+                    keys.name, keys.storage_dtype
+                ),
+            });
+        }
+        let dtype = if float_bytes(keys.storage_dtype).is_some() {
+            keys.storage_dtype
+        } else {
+            ModelDType::F32
+        };
+        let name = format!("layers.{layer}.self_attn.k_nope_proj");
+        let size = heads * nope * latent * float_bytes(dtype).expect("a float type") as u64;
+        derived.insert(
+            name.clone(),
+            (
+                Derivation::HeadTranspose {
+                    source: keys.name.clone(),
+                    dtype: keys.storage_dtype,
+                    heads,
+                    rows: latent,
+                    columns: nope,
+                },
+                size,
+            ),
+        );
+        added.push(derived_tensor(
+            &keys,
+            name,
+            vec![heads * nope, latent],
+            dtype,
+            size,
+        ));
+    }
+    Ok(())
 }
 
 impl ProductionArtifactPayloadSource for LayeredTensorSource {
@@ -438,6 +724,50 @@ impl ProductionArtifactPayloadSource for LayeredTensorSource {
             Derivation::Ranges { source, ranges } => {
                 for (offset, length) in ranges {
                     bytes.extend(self.inner.read_within(source, *offset, *length)?);
+                }
+            }
+            Derivation::HeadTranspose {
+                source,
+                dtype,
+                heads,
+                rows,
+                columns,
+            } => {
+                let total = self.inner.tensor_length(source)?;
+                let raw = self.inner.read_within(source, 0, total)?;
+                let (heads, rows, columns) = (*heads as usize, *rows as usize, *columns as usize);
+                // Element `(head, row, column)` of the source goes to row
+                // `head * columns + column`, column `row`.
+                let source_index =
+                    |head: usize, column: usize, row: usize| (head * rows + row) * columns + column;
+                let order = (0..heads).flat_map(|head| {
+                    (0..columns)
+                        .flat_map(move |column| (0..rows).map(move |row| (head, column, row)))
+                });
+                match float_bytes(*dtype) {
+                    Some(size) => {
+                        for (head, column, row) in order {
+                            let at = source_index(head, column, row) * size;
+                            bytes.extend_from_slice(&raw[at..at + size]);
+                        }
+                    }
+                    None => {
+                        let values = dequantize(&raw, *dtype).ok_or_else(|| {
+                            malformed(format!("'{source}' cannot be dequantized"))
+                        })?;
+                        if values.len() != heads * rows * columns {
+                            return Err(malformed(format!(
+                                "'{source}' dequantized to {} values, not {}",
+                                values.len(),
+                                heads * rows * columns
+                            )));
+                        }
+                        for (head, column, row) in order {
+                            bytes.extend_from_slice(
+                                &values[source_index(head, column, row)].to_le_bytes(),
+                            );
+                        }
+                    }
                 }
             }
             Derivation::Router {

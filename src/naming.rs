@@ -17,7 +17,11 @@ use magnetar_runtime::production_model_ingestion::ProductionIngestionError;
 /// `normalize_tensor_name` exactly in its accepted/rejected shapes:
 /// - `blk.N.attn_{q,k,v}.bias` is accepted and canonicalized to
 ///   `layers.N.self_attn.{q,k,v}_bias` (Qwen2/2.5's real architectural
-///   QKV bias, the only bias GGUF Qwen2 exports carry).
+///   QKV bias, the only bias GGUF Qwen2 exports carry), and
+///   `blk.N.exp_probs_b.bias` to `layers.N.moe.selection_bias` (a sigmoid
+///   router's selection-only bias, which the Component adds itself).
+/// - a latent-attention layer's fused projections take internal names
+///   that `layered_tensors.rs` splits by rows.
 /// - any other bias tensor is rejected with `UnsupportedFormat`: the
 ///   production Qwen Component's graph does not add a bias term to any
 ///   other projection, so silently dropping one would produce numerically
@@ -33,6 +37,8 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
                 "attn_q" => Some("self_attn.q_bias"),
                 "attn_k" => Some("self_attn.k_bias"),
                 "attn_v" => Some("self_attn.v_bias"),
+                // A sigmoid router's selection-only bias per expert.
+                "exp_probs_b" => Some("moe.selection_bias"),
                 _ => None,
             };
             if let Some(canonical_bias_suffix) = canonical_bias_suffix {
@@ -41,8 +47,8 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
         }
         return Err(ProductionIngestionError::UnsupportedFormat {
             reason: format!(
-                "tensor '{raw}' is a bias term for '{suffix}'; the production Qwen Component \
-                 graph only supports attention q/k/v bias terms"
+                "tensor '{raw}' is a bias term for '{suffix}'; only attention q/k/v bias \
+                 terms and a router's selection bias are supported"
             ),
         });
     }
@@ -102,6 +108,17 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
             "ffn_up_shexp" => "moe.shared_up_proj",
             "ffn_down_shexp" => "moe.shared_down_proj",
             "ffn_gate_inp_shexp" => "moe.shared_expert_gate",
+            // Latent attention (`express-latent-attention-forms`): the
+            // fused projections take internal names that
+            // `layered_tensors.rs` splits by rows.
+            "attn_q_a" => "self_attn.q_a_proj",
+            "attn_q_a_norm" => "self_attn.q_a_norm",
+            "attn_q_b" => crate::layered_tensors::QUERY_UP_PROJECTION,
+            "attn_kv_a_mqa" => crate::layered_tensors::LATENT_DOWN_PROJECTION,
+            "attn_kv_a_norm" => "self_attn.kv_a_norm",
+            "attn_kv_b" => crate::layered_tensors::LATENT_UP_PROJECTION,
+            "attn_k_b" => crate::layered_tensors::KEY_UP_PER_HEAD,
+            "attn_v_b" => crate::layered_tensors::VALUE_UP_PER_HEAD,
             other => {
                 return Err(ProductionIngestionError::MalformedMetadata {
                     reason: format!(
@@ -338,8 +355,32 @@ mod tests {
             ProductionIngestionError::MalformedMetadata { .. }
         ));
     }
-}
 
+    /// A `deepseek2` file's latent-attention projections and router bias.
+    #[test]
+    fn latent_attention_tensors_take_their_names() {
+        let cases = [
+            ("blk.2.attn_q_a.weight", "layers.2.self_attn.q_a_proj"),
+            ("blk.2.attn_q_a_norm.weight", "layers.2.self_attn.q_a_norm"),
+            ("blk.2.attn_q_b.weight", "layers.2.packed.q_b_proj"),
+            (
+                "blk.2.attn_kv_a_mqa.weight",
+                "layers.2.packed.kv_a_proj_with_mqa",
+            ),
+            (
+                "blk.2.attn_kv_a_norm.weight",
+                "layers.2.self_attn.kv_a_norm",
+            ),
+            ("blk.2.attn_kv_b.weight", "layers.2.packed.kv_b_proj"),
+            ("blk.2.attn_k_b.weight", "layers.2.packed.k_b_proj"),
+            ("blk.2.attn_v_b.weight", "layers.2.packed.v_b_proj"),
+            ("blk.2.exp_probs_b.bias", "layers.2.moe.selection_bias"),
+        ];
+        for (raw, canonical) in cases {
+            assert_eq!(normalize_tensor_name(raw).unwrap(), canonical, "{raw}");
+        }
+    }
+}
 #[cfg(test)]
 mod gemma4_tests {
     use super::*;
