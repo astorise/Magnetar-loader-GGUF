@@ -380,6 +380,41 @@ mod tests {
             assert_eq!(normalize_tensor_name(raw).unwrap(), canonical, "{raw}");
         }
     }
+
+    /// Every tensor field of `DeepSeek-V2-Lite-Chat.Q4_K_M.gguf`
+    /// (mradermacher, 2024), as listed by its header, has a canonical name.
+    #[test]
+    fn every_tensor_of_a_real_deepseek2_file_has_a_name() {
+        let fields = [
+            "attn_kv_a_mqa",
+            "attn_kv_a_norm",
+            "attn_kv_b",
+            "attn_norm",
+            "attn_output",
+            "attn_q",
+            "ffn_down",
+            "ffn_down_exps",
+            "ffn_down_shexp",
+            "ffn_gate",
+            "ffn_gate_exps",
+            "ffn_gate_inp",
+            "ffn_gate_shexp",
+            "ffn_norm",
+            "ffn_up",
+            "ffn_up_exps",
+            "ffn_up_shexp",
+        ];
+        for field in fields {
+            let raw = format!("blk.3.{field}.weight");
+            assert!(
+                normalize_tensor_name_for(&raw, "deepseek2").is_ok(),
+                "{raw}"
+            );
+        }
+        for raw in ["output.weight", "output_norm.weight", "token_embd.weight"] {
+            assert!(normalize_tensor_name_for(raw, "deepseek2").is_ok(), "{raw}");
+        }
+    }
 }
 #[cfg(test)]
 mod gemma4_tests {
