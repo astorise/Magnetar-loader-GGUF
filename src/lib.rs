@@ -169,6 +169,30 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
         architecture_config.attention_bias = tensors
             .iter()
             .any(|tensor| tensor.name.ends_with("self_attn.q_bias"));
+        // A layered file (`per-layer-kv-geometry`): its layers' geometry,
+        // with the rotated fraction read from its `rope_freqs` table, which
+        // is not a weight.
+        let rope_freqs = match tensors
+            .iter()
+            .position(|tensor| tensor.name == "rope_freqs")
+        {
+            Some(index) => {
+                let tensor = tensors.remove(index);
+                Some(read_f32_tensor(&payload_source, &tensor)?)
+            }
+            None => None,
+        };
+        architecture_config.layer_layout = config::layer_layout(
+            &metadata,
+            architecture,
+            &architecture_config,
+            |name| tensors.iter().any(|tensor| tensor.name == name),
+            rope_freqs.as_deref(),
+        )?;
+        (
+            architecture_config.final_logit_softcapping,
+            architecture_config.per_layer_input_size,
+        ) = config::architecture_options(&metadata, architecture);
         architecture_config.mixture_of_experts =
             config::mixture_of_experts(&metadata, architecture, |name| {
                 tensors
@@ -178,7 +202,7 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
             })?;
         architecture_config.validate().map_err(|error| {
             ProductionIngestionError::MalformedMetadata {
-                reason: format!("GGUF mixture of experts is inconsistent: {error}"),
+                reason: format!("GGUF layer layout or mixture of experts is inconsistent: {error}"),
             }
         })?;
         let tie_word_embeddings = !tensors.iter().any(|tensor| tensor.name == "lm_head");
@@ -355,6 +379,40 @@ impl ProductionModelArtifactIngestor for GgufIngestor {
             payload_source,
         })
     }
+}
+
+/// The values of a small `F32` tensor, read through `source`.
+fn read_f32_tensor(
+    source: &impl ProductionArtifactPayloadSource,
+    tensor: &magnetar_runtime::model::ModelTensorMetadata,
+) -> Result<Vec<f32>, ProductionIngestionError> {
+    let malformed = |reason: String| ProductionIngestionError::MalformedMetadata { reason };
+    if tensor.storage_dtype != magnetar_runtime::model::ModelDType::F32 {
+        return Err(malformed(format!(
+            "tensor '{}' is stored as {:?}, not F32",
+            tensor.name, tensor.storage_dtype
+        )));
+    }
+    let (Some(offset), Some(length)) = (tensor.offset_bytes, tensor.size_bytes) else {
+        return Err(malformed(format!(
+            "tensor '{}' has no byte range",
+            tensor.name
+        )));
+    };
+    let bytes = source.read_payload(
+        &magnetar_runtime::production_model_ingestion::ProductionPayloadRange {
+            identity: tensor.name.clone(),
+            offset,
+            length,
+            digest: None,
+        },
+    )?;
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect())
 }
 
 #[cfg(test)]
@@ -560,6 +618,153 @@ mod tests {
             },
         ];
         build_gguf(&kvs, &tensors, 32)
+    }
+
+    fn kv_array(key: &str, element_type: u32, values: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = gguf_string(key);
+        out.extend(le_u32(9));
+        out.extend(le_u32(element_type));
+        out.extend(le_u64(values.len() as u64));
+        for value in values {
+            out.extend(value);
+        }
+        out
+    }
+
+    /// A two-layer `gemma4` file: layer 0 slides over 8 tokens with
+    /// 2-wide heads and its own V; layer 1 attends over the whole context
+    /// with 4-wide heads, half of each rotated (`rope_freqs` `[1, 1e30]`),
+    /// and no `attn_v`.
+    fn tiny_gemma4_gguf() -> Vec<u8> {
+        let kvs = vec![
+            kv_string("general.architecture", "gemma4"),
+            kv_string("general.name", "tiny-gemma4-test"),
+            kv_uint32("gemma4.embedding_length", 2),
+            kv_array("gemma4.feed_forward_length", 4, &[le_u32(4), le_u32(4)]),
+            kv_uint32("gemma4.block_count", 2),
+            kv_uint32("gemma4.attention.head_count", 1),
+            kv_array("gemma4.attention.head_count_kv", 4, &[le_u32(1), le_u32(1)]),
+            kv_float32("gemma4.attention.layer_norm_rms_epsilon", 1e-6),
+            kv_float32("gemma4.rope.freq_base", 1_000_000.0),
+            kv_float32("gemma4.rope.freq_base_swa", 10_000.0),
+            kv_uint32("gemma4.attention.key_length", 4),
+            kv_uint32("gemma4.attention.value_length", 4),
+            kv_uint32("gemma4.attention.key_length_swa", 2),
+            kv_uint32("gemma4.attention.value_length_swa", 2),
+            kv_uint32("gemma4.attention.sliding_window", 8),
+            kv_uint32("gemma4.attention.shared_kv_layers", 0),
+            kv_uint32("gemma4.embedding_length_per_layer_input", 0),
+            kv_float32("gemma4.final_logit_softcapping", 30.0),
+            kv_array(
+                "gemma4.attention.sliding_window_pattern",
+                7,
+                &[vec![1], vec![0]],
+            ),
+            kv_uint32("tokenizer.ggml.bos_token_id", 0),
+            kv_uint32("tokenizer.ggml.eos_token_id", 1),
+            kv_string("tokenizer.ggml.model", "gpt2"),
+            kv_string_array(
+                "tokenizer.ggml.tokens",
+                &["<bos>", "<eos>", "hello", "world"],
+            ),
+            kv_string_array("tokenizer.ggml.merges", &[]),
+        ];
+        let tensor = |name: &'static str, dimensions: Vec<u64>| {
+            let count: u64 = dimensions.iter().product();
+            TestTensor {
+                name,
+                dimensions,
+                ggml_type: 0,
+                data: f32_bytes(&(0..count).map(|i| i as f32 * 0.1 + 0.5).collect::<Vec<_>>()),
+            }
+        };
+        let mut tensors = vec![
+            tensor("token_embd.weight", vec![2, 4]),
+            tensor("output_norm.weight", vec![2]),
+            TestTensor {
+                name: "rope_freqs.weight",
+                dimensions: vec![2],
+                ggml_type: 0,
+                data: f32_bytes(&[1.0, 1e30]),
+            },
+        ];
+        // GGUF `ne` order: `[in, out]`.
+        for (layer, head) in [(0, 2u64), (1, 4u64)] {
+            let name = |field: &str| -> &'static str {
+                Box::leak(format!("blk.{layer}.{field}.weight").into_boxed_str())
+            };
+            tensors.extend([
+                tensor(name("attn_norm"), vec![2]),
+                tensor(name("attn_q"), vec![2, head]),
+                tensor(name("attn_k"), vec![2, head]),
+                tensor(name("attn_q_norm"), vec![head]),
+                tensor(name("attn_k_norm"), vec![head]),
+                tensor(name("attn_output"), vec![head, 2]),
+                tensor(name("post_attention_norm"), vec![2]),
+                tensor(name("ffn_norm"), vec![2]),
+                tensor(name("ffn_gate"), vec![2, 4]),
+                tensor(name("ffn_up"), vec![2, 4]),
+                tensor(name("ffn_down"), vec![4, 2]),
+                tensor(name("post_ffw_norm"), vec![2]),
+                tensor(name("layer_output_scale"), vec![1]),
+            ]);
+            if layer == 0 {
+                tensors.push(tensor(name("attn_v"), vec![2, head]));
+            }
+        }
+        build_gguf(&kvs, &tensors, 32)
+    }
+
+    /// `per-layer-kv-geometry`: a `gemma4` file ingests with its layers'
+    /// geometry, its options, the layered logical names, and no
+    /// `rope_freqs` weight.
+    #[test]
+    fn ingests_a_layered_gemma4_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(GGUF_FILE_NAME), tiny_gemma4_gguf()).unwrap();
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let result = GgufIngestor::new().ingest(&source).expect("bundle ingests");
+        assert_eq!(result.manifest.architecture.family, "gemma4");
+        let config = result.manifest.architecture_config.clone().unwrap();
+        assert_eq!(config.head_dim, 2);
+        assert_eq!(config.rope_theta, 10_000.0);
+        assert_eq!(config.final_logit_softcapping, Some(30.0));
+        assert_eq!(config.per_layer_input_size, None);
+        let layout = config.layer_layout.unwrap();
+        assert_eq!(layout[0].sliding_window, Some(8));
+        assert_eq!(layout[0].head_dim, 2);
+        assert!(!layout[0].value_from_key);
+        assert_eq!(layout[1].sliding_window, None);
+        assert_eq!(layout[1].head_dim, 4);
+        assert_eq!(layout[1].rope_theta, 1_000_000.0);
+        assert_eq!(layout[1].partial_rotary_factor, Some(0.5));
+        assert!(layout[1].value_from_key);
+        let names: Vec<&str> = result
+            .manifest
+            .tensors
+            .iter()
+            .map(|tensor| tensor.name.as_str())
+            .collect();
+        assert!(!names.contains(&"rope_freqs"));
+        for name in [
+            "layers.1.self_attn.q_norm",
+            "layers.1.pre_ffn_norm",
+            "layers.1.post_attn_norm",
+            "layers.1.layer_scalar",
+        ] {
+            assert!(names.contains(&name), "{name} in {names:?}");
+        }
+        // Projections are transposed to `[in, out]`.
+        let q = result
+            .manifest
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == "layers.1.self_attn.q_proj")
+            .unwrap();
+        assert_eq!(q.shape, vec![2, 4]);
     }
 
     #[test]

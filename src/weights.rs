@@ -201,6 +201,10 @@ pub fn discover_and_parse_weights(
     })?;
     let artifact = parse_header(&path)?;
 
+    let architecture = match artifact.metadata.get("general.architecture") {
+        Some(magnetar_format_gguf::GgufMetadataValue::String(name)) => name.clone(),
+        _ => String::new(),
+    };
     let mut locations = BTreeMap::new();
     let mut tensors = Vec::with_capacity(artifact.tensors.len());
     for mut tensor in artifact.tensors {
@@ -254,7 +258,7 @@ pub fn discover_and_parse_weights(
             }
         }
 
-        let canonical = crate::naming::normalize_tensor_name(&tensor.name)?;
+        let canonical = crate::naming::normalize_tensor_name_for(&tensor.name, &architecture)?;
         // A stacked expert tensor, `[experts, out, in]` row-major, is the
         // 2D matrix `[experts * out, in]` over the same bytes: expert `e`
         // owns rows `[e*out, (e+1)*out)`, which the projection transpose

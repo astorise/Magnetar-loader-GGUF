@@ -13,7 +13,7 @@
 //! schema.
 
 use magnetar_format_gguf::GgufMetadataValue;
-use magnetar_runtime::model::ModelArchitectureConfig;
+use magnetar_runtime::model::{LayerSpec, ModelArchitectureConfig};
 use magnetar_runtime::production_model_ingestion::ProductionIngestionError;
 use std::collections::BTreeMap;
 
@@ -21,8 +21,9 @@ use std::collections::BTreeMap;
 /// decoder-block key schema (`<arch>.*`); they differ in how llama.cpp's
 /// converter stores the attention projections (see
 /// [`rope_rows_interleaved`]) and, for `qwen2moe`, in a routed
-/// mixture-of-experts MLP ([`mixture_of_experts`]).
-pub const SUPPORTED_ARCHITECTURES: [&str; 3] = ["qwen2", "llama", "qwen2moe"];
+/// mixture-of-experts MLP ([`mixture_of_experts`]); `gemma4` declares its
+/// layers' differing geometry ([`layer_layout`]).
+pub const SUPPORTED_ARCHITECTURES: [&str; 4] = ["qwen2", "llama", "qwen2moe", "gemma4"];
 
 /// Whether llama.cpp's converter permuted `architecture`'s query and key
 /// projection rows for its interleaved-pair RoPE: it does for `llama`
@@ -70,6 +71,26 @@ fn float_value(metadata: &BTreeMap<String, GgufMetadataValue>, key: &str) -> Opt
     }
 }
 
+/// An unsigned value, or the first element of an array of them (a
+/// per-layer key such as `attention.head_count_kv` in a layered file).
+fn uint_or_first(metadata: &BTreeMap<String, GgufMetadataValue>, key: &str) -> Option<u64> {
+    uint_value(metadata, key).or_else(|| uint_at(metadata, key, 0))
+}
+
+/// Element `index` of an unsigned per-layer array, or the scalar the key
+/// holds for every layer.
+fn uint_at(metadata: &BTreeMap<String, GgufMetadataValue>, key: &str, index: usize) -> Option<u64> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::Array(values)) => match values.get(index)? {
+            GgufMetadataValue::UInt32(value) => Some(u64::from(*value)),
+            GgufMetadataValue::UInt64(value) => Some(*value),
+            GgufMetadataValue::Int32(value) => u64::try_from(*value).ok(),
+            _ => None,
+        },
+        _ => uint_value(metadata, key),
+    }
+}
+
 fn required_uint(
     metadata: &BTreeMap<String, GgufMetadataValue>,
     key: &str,
@@ -89,10 +110,30 @@ pub fn mixture_of_experts(
     architecture: &str,
     stored_shape: impl Fn(&str) -> Option<Vec<u64>>,
 ) -> Result<Option<magnetar_runtime::model::MixtureOfExpertsConfig>, ProductionIngestionError> {
+    let key = |name: &str| format!("{architecture}.{name}");
+    if architecture == "gemma4" {
+        // Routed experts alongside the dense MLP, renormalized, no shared
+        // expert; their width is declared.
+        let Some(experts) = uint_value(metadata, &key("expert_count")).filter(|count| *count > 0)
+        else {
+            return Ok(None);
+        };
+        let field = |name: &str| required_uint(metadata, &key(name));
+        let narrow = |value: u64, name: &str| {
+            u32::try_from(value)
+                .map_err(|_| malformed(format!("GGUF metadata's {name} does not fit in a u32")))
+        };
+        return Ok(Some(magnetar_runtime::model::MixtureOfExpertsConfig {
+            experts: narrow(experts, "expert_count")?,
+            experts_per_token: narrow(field("expert_used_count")?, "expert_used_count")?,
+            expert_intermediate_size: field("expert_feed_forward_length")?,
+            shared_expert_intermediate_size: None,
+            normalize_top_k: true,
+        }));
+    }
     if architecture != "qwen2moe" {
         return Ok(None);
     }
-    let key = |name: &str| format!("{architecture}.{name}");
     let count = |name: &str| -> Result<u32, ProductionIngestionError> {
         u32::try_from(required_uint(metadata, &key(name))?)
             .map_err(|_| malformed(format!("GGUF metadata's {name} does not fit in a u32")))
@@ -161,12 +202,20 @@ pub fn normalize(
     let key = |name: &str| format!("{architecture}.{name}");
 
     let hidden_size = required_uint(metadata, &key("embedding_length"))?;
-    let intermediate_size = required_uint(metadata, &key("feed_forward_length"))?;
+    // A layered file declares some values per layer: the architecture-wide
+    // one is the first layer's (`layer_layout` gives every layer's).
+    let intermediate_size =
+        uint_or_first(metadata, &key("feed_forward_length")).ok_or_else(|| {
+            malformed(format!(
+                "GGUF metadata is missing required key '{}'",
+                key("feed_forward_length")
+            ))
+        })?;
     let num_hidden_layers = u32::try_from(required_uint(metadata, &key("block_count"))?)
         .map_err(|_| malformed("GGUF metadata's block_count does not fit in a u32"))?;
     let num_attention_heads = u32::try_from(required_uint(metadata, &key("attention.head_count"))?)
         .map_err(|_| malformed("GGUF metadata's attention.head_count does not fit in a u32"))?;
-    let num_key_value_heads = match uint_value(metadata, &key("attention.head_count_kv")) {
+    let num_key_value_heads = match uint_or_first(metadata, &key("attention.head_count_kv")) {
         Some(value) => u32::try_from(value).map_err(|_| {
             malformed("GGUF metadata's attention.head_count_kv does not fit in a u32")
         })?,
@@ -191,7 +240,11 @@ pub fn normalize(
         )));
     }
 
-    let head_dim = match uint_value(metadata, &key("attention.key_length")) {
+    // A sliding-window layer's head width when the file declares one apart
+    // (`key_length_swa`): the architecture-wide width of a layered file.
+    let head_dim = match uint_value(metadata, &key("attention.key_length_swa"))
+        .or_else(|| uint_value(metadata, &key("attention.key_length")))
+    {
         Some(declared) => declared,
         None => {
             if !hidden_size.is_multiple_of(u64::from(num_attention_heads)) {
@@ -212,7 +265,9 @@ pub fn normalize(
 
     let rms_norm_eps =
         float_value(metadata, &key("attention.layer_norm_rms_epsilon")).unwrap_or(1e-6) as f32;
-    let rope_theta = float_value(metadata, &key("rope.freq_base")).unwrap_or(10_000.0);
+    let rope_theta = float_value(metadata, &key("rope.freq_base_swa"))
+        .or_else(|| float_value(metadata, &key("rope.freq_base")))
+        .unwrap_or(10_000.0);
     if rope_theta <= 0.0 {
         return Err(malformed("GGUF metadata's rope.freq_base must be positive"));
     }
@@ -253,9 +308,187 @@ pub fn normalize(
     Ok(architecture_config)
 }
 
+/// The checkpoint-wide options of a layered file: its logit softcap and
+/// its per-layer input width (`0`: none).
+pub fn architecture_options(
+    metadata: &BTreeMap<String, GgufMetadataValue>,
+    architecture: &str,
+) -> (Option<f64>, Option<u32>) {
+    let key = |name: &str| format!("{architecture}.{name}");
+    (
+        float_value(metadata, &key("final_logit_softcapping")),
+        uint_value(metadata, &key("embedding_length_per_layer_input"))
+            .and_then(|width| u32::try_from(width).ok())
+            .filter(|width| *width > 0),
+    )
+}
+
+/// The per-layer geometry of a file declaring
+/// `<arch>.attention.sliding_window_pattern` (`per-layer-kv-geometry`);
+/// `None` for uniform layers. Follows llama.cpp's own conversion:
+/// - a layer whose pattern entry is `true` attends over `sliding_window`
+///   tokens with `key_length_swa`-wide heads and RoPE base
+///   `freq_base_swa`; the others over the whole context with
+///   `key_length`-wide heads and `freq_base`;
+/// - `head_count_kv` and `feed_forward_length` may be per-layer arrays;
+/// - a full layer without its own `attn_v` tensor derives V from K
+///   (`has_tensor` answers for a canonical name);
+/// - `rope_freqs`, when present, holds one factor per rotated pair of a
+///   full layer's head: `1` rotates, a huge factor leaves the pair at
+///   frequency zero. Its leading ones give the rotated fraction;
+/// - the last `shared_kv_layers` layers reuse the K/V of the last earlier
+///   layer of their kind.
+pub fn layer_layout(
+    metadata: &BTreeMap<String, GgufMetadataValue>,
+    architecture: &str,
+    base: &ModelArchitectureConfig,
+    has_tensor: impl Fn(&str) -> bool,
+    rope_freqs: Option<&[f32]>,
+) -> Result<Option<Vec<LayerSpec>>, ProductionIngestionError> {
+    let key = |name: &str| format!("{architecture}.{name}");
+    let Some(GgufMetadataValue::Array(pattern)) =
+        metadata.get(&key("attention.sliding_window_pattern"))
+    else {
+        return Ok(None);
+    };
+    let layers = base.num_hidden_layers as usize;
+    if pattern.len() != layers {
+        return Err(malformed(format!(
+            "GGUF metadata's sliding_window_pattern has {} entries for {layers} layers",
+            pattern.len()
+        )));
+    }
+    let sliding: Vec<bool> = pattern
+        .iter()
+        .map(|entry| match entry {
+            GgufMetadataValue::Bool(value) => Ok(*value),
+            other => Err(malformed(format!(
+                "GGUF metadata's sliding_window_pattern holds {other:?}, not booleans"
+            ))),
+        })
+        .collect::<Result<_, _>>()?;
+    let full_head_dim = uint_value(metadata, &key("attention.key_length")).unwrap_or(base.head_dim);
+    let sliding_head_dim =
+        uint_value(metadata, &key("attention.key_length_swa")).unwrap_or(full_head_dim);
+    for (value, keys, width) in [
+        (
+            "attention.value_length",
+            "attention.key_length",
+            full_head_dim,
+        ),
+        (
+            "attention.value_length_swa",
+            "attention.key_length_swa",
+            sliding_head_dim,
+        ),
+    ] {
+        if uint_value(metadata, &key(value)).is_some_and(|value| value != width) {
+            return Err(ProductionIngestionError::UnsupportedFormat {
+                reason: format!("GGUF metadata's {value} differs from its {keys}"),
+            });
+        }
+    }
+    let full_theta = float_value(metadata, &key("rope.freq_base")).unwrap_or(base.rope_theta);
+    let sliding_theta = float_value(metadata, &key("rope.freq_base_swa")).unwrap_or(full_theta);
+    let window = uint_value(metadata, &key("attention.sliding_window"))
+        .map(|window| {
+            u32::try_from(window)
+                .map_err(|_| malformed("GGUF metadata's sliding_window does not fit in a u32"))
+        })
+        .transpose()?;
+    // The rotated fraction of a full layer's head.
+    let partial_rotary_factor = match rope_freqs {
+        None => None,
+        Some(factors) => {
+            let rotated = factors.iter().take_while(|factor| **factor == 1.0).count();
+            if factors[rotated..].iter().any(|factor| *factor < 1e20) {
+                return Err(ProductionIngestionError::UnsupportedFormat {
+                    reason: "GGUF rope_freqs scales frequencies rather than selecting the \
+                             rotated pairs, which layered loading does not support"
+                        .into(),
+                });
+            }
+            let factor = (2 * rotated) as f64 / full_head_dim as f64;
+            (factor != 1.0).then_some(factor)
+        }
+    };
+    let shared = uint_value(metadata, &key("attention.shared_kv_layers")).unwrap_or(0) as usize;
+    let first_shared = layers.checked_sub(shared).ok_or_else(|| {
+        malformed(format!(
+            "GGUF metadata shares the K/V of {shared} of {layers} layers"
+        ))
+    })?;
+    let mut layout = Vec::with_capacity(layers);
+    for (index, is_sliding) in sliding.iter().copied().enumerate() {
+        let kv_source_layer = if index >= first_shared {
+            let producer = sliding[..first_shared]
+                .iter()
+                .rposition(|producer| *producer == is_sliding)
+                .ok_or_else(|| {
+                    malformed(format!(
+                        "GGUF layer {index} shares the K/V of an earlier layer of its kind, \
+                         but none computes its own"
+                    ))
+                })?;
+            Some(producer as u32)
+        } else {
+            None
+        };
+        let kv_heads = uint_at(metadata, &key("attention.head_count_kv"), index)
+            .unwrap_or(u64::from(base.num_key_value_heads));
+        layout.push(LayerSpec {
+            sliding_window: if is_sliding {
+                Some(window.ok_or_else(|| {
+                    malformed("GGUF metadata has sliding layers but no sliding_window")
+                })?)
+            } else {
+                None
+            },
+            head_dim: if is_sliding {
+                sliding_head_dim
+            } else {
+                full_head_dim
+            },
+            num_key_value_heads: u32::try_from(kv_heads)
+                .map_err(|_| malformed("GGUF metadata's head_count_kv does not fit in a u32"))?,
+            rope_theta: if is_sliding {
+                sliding_theta
+            } else {
+                full_theta
+            },
+            partial_rotary_factor: if is_sliding {
+                None
+            } else {
+                partial_rotary_factor
+            },
+            value_from_key: !is_sliding
+                && kv_source_layer.is_none()
+                && !has_tensor(&format!("layers.{index}.self_attn.v_proj")),
+            kv_source_layer,
+            intermediate_size: uint_at(metadata, &key("feed_forward_length"), index)
+                .unwrap_or(base.intermediate_size),
+        });
+    }
+    let uniform = LayerSpec {
+        sliding_window: None,
+        head_dim: base.head_dim,
+        num_key_value_heads: base.num_key_value_heads,
+        rope_theta: base.rope_theta,
+        partial_rotary_factor: None,
+        value_from_key: false,
+        kv_source_layer: None,
+        intermediate_size: base.intermediate_size,
+    };
+    Ok((!layout.iter().all(|layer| *layer == uniform)).then_some(layout))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) fn qwen2_0_5b_metadata_for_layout() -> BTreeMap<String, GgufMetadataValue> {
+        qwen2_0_5b_metadata()
+    }
 
     fn qwen2_0_5b_metadata() -> BTreeMap<String, GgufMetadataValue> {
         let mut metadata = BTreeMap::new();
@@ -404,5 +637,196 @@ mod tests {
         );
         let config = normalize(&metadata, 151936).unwrap();
         assert_eq!(config.head_dim, 128);
+    }
+}
+
+/// `per-layer-kv-geometry`: the metadata of llama.cpp's `gemma4` files, as
+/// read from the headers of `google/gemma-4-E2B-it-qat-q4_0-gguf` and
+/// `google/gemma-4-26B-A4B-it-qat-q4_0-gguf`. They give the layouts the
+/// Hugging Face `config.json` of the same checkpoints gives.
+#[cfg(test)]
+mod gemma4_tests {
+    use super::*;
+
+    fn insert(
+        metadata: &mut BTreeMap<String, GgufMetadataValue>,
+        key: &str,
+        value: GgufMetadataValue,
+    ) {
+        metadata.insert(format!("gemma4.{key}"), value);
+    }
+
+    fn pattern(layers: usize, full_every: usize, first_full: usize) -> GgufMetadataValue {
+        GgufMetadataValue::Array(
+            (0..layers)
+                .map(|index| GgufMetadataValue::Bool(index % full_every != first_full))
+                .collect(),
+        )
+    }
+
+    fn uints(values: impl IntoIterator<Item = u32>) -> GgufMetadataValue {
+        GgufMetadataValue::Array(values.into_iter().map(GgufMetadataValue::UInt32).collect())
+    }
+
+    fn e2b() -> BTreeMap<String, GgufMetadataValue> {
+        use GgufMetadataValue::{Float32, UInt32};
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("gemma4".into()),
+        );
+        insert(&mut metadata, "block_count", UInt32(35));
+        insert(&mut metadata, "embedding_length", UInt32(1536));
+        insert(
+            &mut metadata,
+            "feed_forward_length",
+            uints((0..35).map(|index| if index < 15 { 6144 } else { 12288 })),
+        );
+        insert(&mut metadata, "attention.head_count", UInt32(8));
+        insert(&mut metadata, "attention.head_count_kv", UInt32(1));
+        insert(&mut metadata, "rope.freq_base", Float32(1_000_000.0));
+        insert(&mut metadata, "rope.freq_base_swa", Float32(10_000.0));
+        insert(
+            &mut metadata,
+            "attention.layer_norm_rms_epsilon",
+            Float32(1e-6),
+        );
+        insert(&mut metadata, "attention.key_length", UInt32(512));
+        insert(&mut metadata, "attention.value_length", UInt32(512));
+        insert(&mut metadata, "attention.key_length_swa", UInt32(256));
+        insert(&mut metadata, "attention.value_length_swa", UInt32(256));
+        insert(&mut metadata, "final_logit_softcapping", Float32(30.0));
+        insert(&mut metadata, "attention.sliding_window", UInt32(512));
+        insert(&mut metadata, "attention.shared_kv_layers", UInt32(20));
+        insert(
+            &mut metadata,
+            "embedding_length_per_layer_input",
+            UInt32(256),
+        );
+        insert(
+            &mut metadata,
+            "attention.sliding_window_pattern",
+            pattern(35, 5, 4),
+        );
+        metadata
+    }
+
+    /// `rope_freqs` of a full layer with 512-wide heads: the first 64 of
+    /// 256 pairs rotate.
+    fn rope_freqs() -> Vec<f32> {
+        (0..256)
+            .map(|pair| if pair < 64 { 1.0 } else { 1e30 })
+            .collect()
+    }
+
+    #[test]
+    fn an_e2b_file_slides_shares_kv_and_rotates_a_quarter_of_full_heads() {
+        let metadata = e2b();
+        let base = normalize(&metadata, 262_144).unwrap();
+        assert_eq!(base.head_dim, 256);
+        assert_eq!(base.num_key_value_heads, 1);
+        assert_eq!(base.intermediate_size, 6144);
+        assert_eq!(base.rope_theta, 10_000.0);
+        let layout = layer_layout(&metadata, "gemma4", &base, |_| true, Some(&rope_freqs()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(layout.len(), 35);
+        assert_eq!(layout[0].sliding_window, Some(512));
+        assert_eq!(layout[0].head_dim, 256);
+        assert_eq!(layout[0].rope_theta, 10_000.0);
+        assert_eq!(layout[0].partial_rotary_factor, None);
+        assert_eq!(layout[4].sliding_window, None);
+        assert_eq!(layout[4].head_dim, 512);
+        assert_eq!(layout[4].rope_theta, 1_000_000.0);
+        assert_eq!(layout[4].partial_rotary_factor, Some(0.25));
+        assert!(!layout[4].value_from_key);
+        assert_eq!(layout[15].kv_source_layer, Some(13));
+        assert_eq!(layout[19].kv_source_layer, Some(14));
+        assert_eq!(layout[15].intermediate_size, 12288);
+        assert_eq!(
+            architecture_options(&metadata, "gemma4"),
+            (Some(30.0), Some(256))
+        );
+        let mut config = base;
+        config.layer_layout = Some(layout);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn a_full_layer_without_v_projection_derives_v_from_k() {
+        use GgufMetadataValue::UInt32;
+        let mut metadata = e2b();
+        insert(&mut metadata, "block_count", UInt32(30));
+        insert(&mut metadata, "embedding_length", UInt32(2816));
+        insert(&mut metadata, "feed_forward_length", UInt32(2112));
+        insert(&mut metadata, "attention.head_count", UInt32(16));
+        insert(
+            &mut metadata,
+            "attention.head_count_kv",
+            uints((0..30).map(|index| if index % 6 == 5 { 2 } else { 8 })),
+        );
+        insert(&mut metadata, "attention.sliding_window", UInt32(1024));
+        insert(&mut metadata, "attention.shared_kv_layers", UInt32(0));
+        insert(&mut metadata, "embedding_length_per_layer_input", UInt32(0));
+        insert(
+            &mut metadata,
+            "attention.sliding_window_pattern",
+            pattern(30, 6, 5),
+        );
+        insert(&mut metadata, "expert_count", UInt32(128));
+        insert(&mut metadata, "expert_used_count", UInt32(8));
+        insert(&mut metadata, "expert_feed_forward_length", UInt32(704));
+        let base = normalize(&metadata, 262_144).unwrap();
+        assert_eq!(base.num_key_value_heads, 8);
+        // The full layers' files have no `attn_v`.
+        let has_tensor = |name: &str| {
+            !["5", "11", "17", "23", "29"]
+                .iter()
+                .any(|index| name == format!("layers.{index}.self_attn.v_proj"))
+        };
+        let layout = layer_layout(&metadata, "gemma4", &base, has_tensor, Some(&rope_freqs()))
+            .unwrap()
+            .unwrap();
+        for (index, layer) in layout.iter().enumerate() {
+            let full = index % 6 == 5;
+            assert_eq!(layer.value_from_key, full, "layer {index}");
+            assert_eq!(layer.num_key_value_heads, if full { 2 } else { 8 });
+            assert_eq!(layer.kv_source_layer, None);
+        }
+        assert_eq!(
+            architecture_options(&metadata, "gemma4"),
+            (Some(30.0), None)
+        );
+        assert_eq!(
+            mixture_of_experts(&metadata, "gemma4", |_| None).unwrap(),
+            Some(magnetar_runtime::model::MixtureOfExpertsConfig {
+                experts: 128,
+                experts_per_token: 8,
+                expert_intermediate_size: 704,
+                shared_expert_intermediate_size: None,
+                normalize_top_k: true,
+            })
+        );
+    }
+
+    #[test]
+    fn rope_freqs_scaling_frequencies_is_refused() {
+        let metadata = e2b();
+        let base = normalize(&metadata, 262_144).unwrap();
+        let scaling: Vec<f32> = (0..256).map(|pair| 1.0 + pair as f32).collect();
+        assert!(matches!(
+            layer_layout(&metadata, "gemma4", &base, |_| true, Some(&scaling)),
+            Err(ProductionIngestionError::UnsupportedFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn a_file_without_sliding_pattern_keeps_uniform_layers() {
+        let metadata = super::tests::qwen2_0_5b_metadata_for_layout();
+        let base = normalize(&metadata, 151_936).unwrap();
+        assert_eq!(
+            layer_layout(&metadata, "qwen2", &base, |_| true, None).unwrap(),
+            None
+        );
     }
 }

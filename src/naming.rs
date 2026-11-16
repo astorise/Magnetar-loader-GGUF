@@ -120,6 +120,86 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
     })
 }
 
+/// The canonical name of `raw` in a file of `architecture`: a `gemma4`
+/// file's layered decoder names its norms differently from the others
+/// (its `ffn_norm` precedes the MLP, its `post_attention_norm` follows
+/// attention), carries per-head `q_norm`/`k_norm`, a per-layer scalar and
+/// per-layer input weights, and a `rope_freqs` table the loader reads
+/// itself. Tables packing every layer's per-layer inputs, and its routed
+/// experts, are refused until loading slices or restacks them.
+pub fn normalize_tensor_name_for(
+    raw: &str,
+    architecture: &str,
+) -> Result<String, ProductionIngestionError> {
+    if architecture != "gemma4" {
+        return normalize_tensor_name(raw);
+    }
+    let unsupported = |what: &str| ProductionIngestionError::UnsupportedFormat {
+        reason: format!("tensor '{raw}' {what}"),
+    };
+    let name = raw.strip_suffix(".weight").ok_or_else(|| {
+        unsupported("is a scale of routed experts, which GGUF loading does not restack yet")
+    })?;
+    match name {
+        "token_embd" => return Ok("token_embedding".into()),
+        "output_norm" => return Ok("final_norm".into()),
+        "output" => return Ok("lm_head".into()),
+        "rope_freqs" => return Ok("rope_freqs".into()),
+        "per_layer_proj_norm" => return Ok("per_layer_projection_norm".into()),
+        "per_layer_token_embd" | "per_layer_model_proj" => {
+            return Err(unsupported(
+                "packs every layer's per-layer input weights into one table, which GGUF \
+                 loading does not slice per layer yet",
+            ));
+        }
+        _ => {}
+    }
+    let Some((layer_index, rest)) = name
+        .strip_prefix("blk.")
+        .and_then(|layer| layer.split_once('.'))
+        .filter(|(index, _)| index.parse::<u64>().is_ok())
+    else {
+        return Err(ProductionIngestionError::MalformedMetadata {
+            reason: format!("tensor '{raw}' does not match any recognized gemma4 tensor name"),
+        });
+    };
+    let canonical_suffix = match rest {
+        "attn_norm" => "input_norm",
+        "post_attention_norm" => "post_attn_norm",
+        "ffn_norm" => "pre_ffn_norm",
+        "post_ffw_norm" => "post_ffn_norm",
+        "pre_ffw_norm_2" => "pre_ffn_norm_2",
+        "post_ffw_norm_1" => "post_ffn_norm_1",
+        "post_ffw_norm_2" => "post_ffn_norm_2",
+        "attn_q" => "self_attn.q_proj",
+        "attn_k" => "self_attn.k_proj",
+        "attn_v" => "self_attn.v_proj",
+        "attn_output" => "self_attn.o_proj",
+        "attn_q_norm" => "self_attn.q_norm",
+        "attn_k_norm" => "self_attn.k_norm",
+        "ffn_gate" => "mlp.gate_proj",
+        "ffn_up" => "mlp.up_proj",
+        "ffn_down" => "mlp.down_proj",
+        "layer_output_scale" => "layer_scalar",
+        "inp_gate" => "per_layer_input_gate",
+        "proj" => "per_layer_projection",
+        "post_norm" => "post_per_layer_input_norm",
+        "ffn_gate_inp" | "ffn_gate_up_exps" | "ffn_gate_exps" | "ffn_up_exps" | "ffn_down_exps" => {
+            return Err(unsupported(
+                "belongs to routed experts, which GGUF loading does not restack for gemma4 yet",
+            ));
+        }
+        other => {
+            return Err(ProductionIngestionError::MalformedMetadata {
+                reason: format!(
+                    "tensor '{raw}' names an unrecognized gemma4 per-layer field '{other}'"
+                ),
+            });
+        }
+    };
+    Ok(format!("layers.{layer_index}.{canonical_suffix}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +315,66 @@ mod tests {
             error2,
             ProductionIngestionError::MalformedMetadata { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod gemma4_tests {
+    use super::*;
+
+    /// The tensor names of llama.cpp's `gemma4` files (read from the
+    /// headers of `google/gemma-4-*-it-qat-q4_0-gguf`).
+    #[test]
+    fn gemma4_tensors_take_the_layered_logical_names() {
+        let cases = [
+            ("token_embd.weight", "token_embedding"),
+            ("output_norm.weight", "final_norm"),
+            ("rope_freqs.weight", "rope_freqs"),
+            ("per_layer_proj_norm.weight", "per_layer_projection_norm"),
+            ("blk.0.attn_norm.weight", "layers.0.input_norm"),
+            (
+                "blk.0.post_attention_norm.weight",
+                "layers.0.post_attn_norm",
+            ),
+            ("blk.0.ffn_norm.weight", "layers.0.pre_ffn_norm"),
+            ("blk.0.post_ffw_norm.weight", "layers.0.post_ffn_norm"),
+            ("blk.3.post_ffw_norm_2.weight", "layers.3.post_ffn_norm_2"),
+            ("blk.4.attn_q_norm.weight", "layers.4.self_attn.q_norm"),
+            ("blk.4.attn_k.weight", "layers.4.self_attn.k_proj"),
+            ("blk.4.layer_output_scale.weight", "layers.4.layer_scalar"),
+            ("blk.4.inp_gate.weight", "layers.4.per_layer_input_gate"),
+            ("blk.4.proj.weight", "layers.4.per_layer_projection"),
+            (
+                "blk.4.post_norm.weight",
+                "layers.4.post_per_layer_input_norm",
+            ),
+        ];
+        for (raw, canonical) in cases {
+            assert_eq!(
+                normalize_tensor_name_for(raw, "gemma4").unwrap(),
+                canonical,
+                "{raw}"
+            );
+        }
+        // Other architectures keep their own naming.
+        assert_eq!(
+            normalize_tensor_name_for("blk.0.ffn_norm.weight", "qwen2").unwrap(),
+            "layers.0.post_attn_norm"
+        );
+        for raw in [
+            "per_layer_token_embd.weight",
+            "per_layer_model_proj.weight",
+            "blk.0.ffn_gate_up_exps.weight",
+            "blk.0.ffn_gate_inp.weight",
+            "blk.0.ffn_down_exps.scale",
+        ] {
+            assert!(
+                matches!(
+                    normalize_tensor_name_for(raw, "gemma4"),
+                    Err(ProductionIngestionError::UnsupportedFormat { .. })
+                ),
+                "{raw}"
+            );
+        }
     }
 }
