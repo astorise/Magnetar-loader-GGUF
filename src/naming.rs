@@ -125,8 +125,9 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
 /// (its `ffn_norm` precedes the MLP, its `post_attention_norm` follows
 /// attention), carries per-head `q_norm`/`k_norm`, a per-layer scalar and
 /// per-layer input weights, and a `rope_freqs` table the loader reads
-/// itself. Tables packing every layer's per-layer inputs, and its routed
-/// experts, are refused until loading slices or restacks them.
+/// itself. Tables packing every layer's per-layer inputs, its fused expert
+/// gate and up projections and its router take internal names that
+/// `layered_tensors.rs` replaces with the per-layer and stacked tensors.
 pub fn normalize_tensor_name_for(
     raw: &str,
     architecture: &str,
@@ -134,23 +135,41 @@ pub fn normalize_tensor_name_for(
     if architecture != "gemma4" {
         return normalize_tensor_name(raw);
     }
-    let unsupported = |what: &str| ProductionIngestionError::UnsupportedFormat {
-        reason: format!("tensor '{raw}' {what}"),
-    };
-    let name = raw.strip_suffix(".weight").ok_or_else(|| {
-        unsupported("is a scale of routed experts, which GGUF loading does not restack yet")
-    })?;
+    // The router's input scale and the experts' output scales have no
+    // `.weight` suffix.
+    if let Some((layer_index, field)) = raw
+        .strip_suffix(".scale")
+        .and_then(|name| name.strip_prefix("blk."))
+        .and_then(|layer| layer.split_once('.'))
+        .filter(|(index, _)| index.parse::<u64>().is_ok())
+    {
+        let canonical = match field {
+            "ffn_gate_inp" => crate::layered_tensors::ROUTER_SCALE,
+            "ffn_down_exps" => "moe.per_expert_scale",
+            other => {
+                return Err(ProductionIngestionError::MalformedMetadata {
+                    reason: format!("tensor '{raw}' scales an unrecognized field '{other}'"),
+                });
+            }
+        };
+        return Ok(format!("layers.{layer_index}.{canonical}"));
+    }
+    let name =
+        raw.strip_suffix(".weight")
+            .ok_or_else(|| ProductionIngestionError::MalformedMetadata {
+                reason: format!("tensor '{raw}' does not end in '.weight' or '.scale'"),
+            })?;
     match name {
         "token_embd" => return Ok("token_embedding".into()),
         "output_norm" => return Ok("final_norm".into()),
         "output" => return Ok("lm_head".into()),
         "rope_freqs" => return Ok("rope_freqs".into()),
         "per_layer_proj_norm" => return Ok("per_layer_projection_norm".into()),
-        "per_layer_token_embd" | "per_layer_model_proj" => {
-            return Err(unsupported(
-                "packs every layer's per-layer input weights into one table, which GGUF \
-                 loading does not slice per layer yet",
-            ));
+        "per_layer_token_embd" => {
+            return Ok(crate::layered_tensors::PER_LAYER_EMBEDDING_TABLE.into());
+        }
+        "per_layer_model_proj" => {
+            return Ok(crate::layered_tensors::PER_LAYER_PROJECTION_TABLE.into());
         }
         _ => {}
     }
@@ -184,11 +203,14 @@ pub fn normalize_tensor_name_for(
         "inp_gate" => "per_layer_input_gate",
         "proj" => "per_layer_projection",
         "post_norm" => "post_per_layer_input_norm",
-        "ffn_gate_inp" | "ffn_gate_up_exps" | "ffn_gate_exps" | "ffn_up_exps" | "ffn_down_exps" => {
-            return Err(unsupported(
-                "belongs to routed experts, which GGUF loading does not restack for gemma4 yet",
-            ));
-        }
+        // Routed experts: the router and fused gate and up projections are
+        // derived (`layered_tensors.rs`); separate gate, up and down
+        // projections are already stacked.
+        "ffn_gate_inp" => crate::layered_tensors::ROUTER_PROJECTION,
+        "ffn_gate_up_exps" => crate::layered_tensors::EXPERTS_GATE_UP,
+        "ffn_gate_exps" => "moe.experts_gate_proj",
+        "ffn_up_exps" => "moe.experts_up_proj",
+        "ffn_down_exps" => "moe.experts_down_proj",
         other => {
             return Err(ProductionIngestionError::MalformedMetadata {
                 reason: format!(
@@ -361,20 +383,33 @@ mod gemma4_tests {
             normalize_tensor_name_for("blk.0.ffn_norm.weight", "qwen2").unwrap(),
             "layers.0.post_attn_norm"
         );
-        for raw in [
-            "per_layer_token_embd.weight",
-            "per_layer_model_proj.weight",
-            "blk.0.ffn_gate_up_exps.weight",
-            "blk.0.ffn_gate_inp.weight",
-            "blk.0.ffn_down_exps.scale",
-        ] {
-            assert!(
-                matches!(
-                    normalize_tensor_name_for(raw, "gemma4"),
-                    Err(ProductionIngestionError::UnsupportedFormat { .. })
-                ),
+        // Packed tables, the router and fused experts take the names
+        // `layered_tensors.rs` derives the requested tensors from.
+        let packed = [
+            ("per_layer_token_embd.weight", "packed.per_layer_token_embd"),
+            ("per_layer_model_proj.weight", "packed.per_layer_model_proj"),
+            (
+                "blk.5.ffn_gate_up_exps.weight",
+                "layers.5.packed.experts_gate_up",
+            ),
+            ("blk.5.ffn_gate_inp.weight", "layers.5.packed.router_proj"),
+            ("blk.5.ffn_gate_inp.scale", "layers.5.packed.router_scale"),
+            (
+                "blk.5.ffn_down_exps.weight",
+                "layers.5.moe.experts_down_proj",
+            ),
+            ("blk.5.ffn_down_exps.scale", "layers.5.moe.per_expert_scale"),
+        ];
+        for (raw, canonical) in packed {
+            assert_eq!(
+                normalize_tensor_name_for(raw, "gemma4").unwrap(),
+                canonical,
                 "{raw}"
             );
         }
+        assert!(matches!(
+            normalize_tensor_name_for("blk.5.attn_q.scale", "gemma4"),
+            Err(ProductionIngestionError::MalformedMetadata { .. })
+        ));
     }
 }
