@@ -1081,8 +1081,15 @@ mod tests {
     /// to. Dimensions here (hidden=4, intermediate=8) hold exactly one real
     /// `Q8_0` block (32 elements) for `ffn_gate` and are deliberately
     /// non-square so a transpose bug could not hide behind symmetry.
-    #[test]
-    fn keeps_a_non_square_quantized_projection_packed_and_declares_it_transposed() {
+    /// Ingests a one-layer file whose `ffn_gate` (GGUF ne `[in=4, out=8]`,
+    /// one 32-value block) is `gate` stored as `ggml_type`, checks it stays
+    /// packed as `dtype` with transposed storage declared, and returns its
+    /// values as Model Loading reads them (`[in=4, out=8]`).
+    fn ingest_a_quantized_gate(
+        ggml_type: u32,
+        gate: Vec<u8>,
+        dtype: magnetar_runtime::model::ModelDType,
+    ) -> Vec<f32> {
         const HIDDEN: u64 = 4;
         const INTERMEDIATE: u64 = 8;
         let kvs = vec![
@@ -1103,12 +1110,6 @@ mod tests {
         let square = vec![1.0f32; (HIDDEN * HIDDEN) as usize];
         let ffn_up_down = vec![1.0f32; (HIDDEN * INTERMEDIATE) as usize];
         let token_embd = vec![1.0f32; (HIDDEN * 4) as usize];
-
-        // One real Q8_0 block: d = 1.0, qs = 1..=32 (GGUF ne=[in=4,
-        // out=8] -- 32 elements, exactly one block).
-        let mut ffn_gate_q8 = Vec::with_capacity(34);
-        ffn_gate_q8.extend_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
-        ffn_gate_q8.extend((1i8..=32).map(|value| value as u8));
 
         let tensors = [
             TestTensor {
@@ -1157,8 +1158,8 @@ mod tests {
             TestTensor {
                 name: "blk.0.ffn_gate.weight",
                 dimensions: vec![HIDDEN, INTERMEDIATE],
-                ggml_type: 8, // GGML_TYPE_Q8_0
-                data: ffn_gate_q8,
+                ggml_type,
+                data: gate,
             },
             TestTensor {
                 name: "blk.0.ffn_up.weight",
@@ -1198,8 +1199,7 @@ mod tests {
             .find(|tensor| tensor.name == "layers.0.mlp.gate_proj")
             .unwrap();
         assert_eq!(
-            ffn_gate.storage_dtype,
-            magnetar_runtime::model::ModelDType::Q8,
+            ffn_gate.storage_dtype, dtype,
             "a quantized tensor keeps its storage dtype"
         );
         assert_eq!(
@@ -1210,12 +1210,20 @@ mod tests {
         // swapped back to the Component's expected [in=4, out=8].
         assert_eq!(ffn_gate.shape, vec![HIDDEN, INTERMEDIATE]);
 
-        let values = magnetar_runtime::model_loading::host_tensor_from_payload_source(
+        magnetar_runtime::model_loading::host_tensor_from_payload_source(
             ffn_gate,
             result.payload_source.as_ref(),
         )
         .expect("Model Loading converts the packed, transposed-storage tensor")
-        .data;
+        .data
+    }
+
+    #[test]
+    fn keeps_a_non_square_quantized_projection_packed_and_declares_it_transposed() {
+        // One real Q8_0 block: d = 1.0, qs = 1..=32.
+        let mut gate = 0x3C00u16.to_le_bytes().to_vec(); // d = 1.0
+        gate.extend((1i8..=32).map(|value| value as u8));
+        let values = ingest_a_quantized_gate(8, gate, magnetar_runtime::model::ModelDType::Q8);
         // Dequantized HF-native [out=8, in=4], row-major, is [[1,2,3,4],
         // [5,6,7,8], [9,10,11,12], [13,14,15,16], [17,18,19,20],
         // [21,22,23,24], [25,26,27,28], [29,30,31,32]]. Transposed to
@@ -1227,6 +1235,23 @@ mod tests {
             3.0, 7.0, 11.0, 15.0, 19.0, 23.0, 27.0, 31.0, //
             4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0,
         ];
+        assert_eq!(values, expected);
+    }
+
+    /// A `Q4_0` projection is kept packed with transposed storage declared,
+    /// as a `Q8_0` one is, never transposed byte by byte.
+    #[test]
+    fn keeps_a_q4_0_projection_packed_and_declares_it_transposed() {
+        // One Q4_0 block: d = 1.0, value `i` is `i % 16 - 8`, so `qs[j]`
+        // holds `j` in both nibbles.
+        let mut gate = 0x3C00u16.to_le_bytes().to_vec(); // d = 1.0
+        gate.extend((0u8..16).map(|j| j | (j << 4)));
+        let values = ingest_a_quantized_gate(2, gate, magnetar_runtime::model::ModelDType::Q4);
+        // HF-native [out=8, in=4] value `i` is `i % 16 - 8`; transposed to
+        // [in=4, out=8], row `r` holds values `r, r + 4, ..., r + 28`.
+        let expected: Vec<f32> = (0..4)
+            .flat_map(|r| (0..8).map(move |c| ((r + 4 * c) % 16) as f32 - 8.0))
+            .collect();
         assert_eq!(values, expected);
     }
 
