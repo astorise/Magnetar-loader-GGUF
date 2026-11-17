@@ -211,6 +211,69 @@ fn sentencepiece_bpe(
     Ok(inner)
 }
 
+/// Gemma 4's tokenizer (`tokenizer.ggml.model == "gemma4"`): a BPE over
+/// SentencePiece-style pieces with explicit `tokenizer.ggml.merges`, as the
+/// upstream `tokenizer.json` describes it. Spaces become `▁` before
+/// merging, no space is added before the text, every unknown character
+/// falls back to its `<0xXX>` byte pieces, and decoding turns `▁` back into
+/// spaces.
+fn gemma4_bpe(
+    metadata: &BTreeMap<String, GgufMetadataValue>,
+    tokens: &[&str],
+    vocab: tokenizers::models::bpe::Vocab,
+) -> Result<HfTokenizerImpl, ProductionIngestionError> {
+    let merges_raw = string_array(metadata, "tokenizer.ggml.merges").ok_or_else(|| {
+        malformed("GGUF metadata is missing required key 'tokenizer.ggml.merges'")
+    })?;
+    // A merge is "left right", split at the first space after the left
+    // piece's first character, as llama.cpp reads it.
+    let merges: tokenizers::models::bpe::Merges = merges_raw
+        .iter()
+        .map(|entry| {
+            let first = entry.chars().next().map_or(0, char::len_utf8);
+            entry[first..]
+                .find(' ')
+                .map(|at| {
+                    let (left, right) = entry.split_at(first + at);
+                    (left.to_string(), right[1..].to_string())
+                })
+                .ok_or_else(|| {
+                    malformed(format!(
+                        "GGUF tokenizer.ggml.merges entry '{entry}' is not a space-separated pair"
+                    ))
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    let mut builder = BPE::builder()
+        .vocab_and_merges(vocab, merges)
+        .byte_fallback(true)
+        .fuse_unk(true);
+    if let Some(unknown) = uint_value(metadata, "tokenizer.ggml.unknown_token_id")
+        .and_then(|id| tokens.get(id as usize))
+    {
+        builder = builder.unk_token((*unknown).to_string());
+    }
+    let bpe = builder.build().map_err(|error| {
+        malformed(format!(
+            "GGUF vocabulary failed to build a Gemma 4 BPE model: {error}"
+        ))
+    })?;
+    let mut inner = HfTokenizerImpl::new(bpe);
+    let to_marker = Replace::new(" ", "\u{2581}")
+        .map_err(|error| malformed(format!("the Gemma 4 normalizer failed: {error}")))?;
+    inner
+        .with_normalizer(Some(to_marker))
+        .map_err(|error| malformed(format!("the Gemma 4 normalizer failed: {error}")))?;
+    let to_space = Replace::new("\u{2581}", " ")
+        .map_err(|error| malformed(format!("the Gemma 4 decoder failed: {error}")))?;
+    inner.with_decoder(Some(DecoderSequence::new(vec![
+        to_space.into(),
+        ByteFallback::new().into(),
+        Fuse::new().into(),
+    ])));
+    Ok(inner)
+}
+
 /// Real, GGUF-embedded-vocabulary [`Tokenizer`] implementation
 /// (Tokenizer Contract). Encode/decode delegate to a real
 /// `tokenizers::Tokenizer` built from this GGUF file's own vocabulary.
@@ -272,11 +335,17 @@ impl GgufTokenizer {
                 "gguf-llama-spm",
                 true,
             ),
+            "gemma4" => (
+                gemma4_bpe(metadata, &tokens, vocab)?,
+                "gguf-gemma4-bpe",
+                true,
+            ),
             other => {
                 return Err(ProductionIngestionError::UnsupportedFormat {
                     reason: format!(
-                        "GGUF tokenizer.ggml.model is '{other}'; only 'gpt2' (byte-level BPE) \
-                         and 'llama' (SentencePiece BPE) are supported"
+                        "GGUF tokenizer.ggml.model is '{other}'; only 'gpt2' (byte-level BPE), \
+                         'llama' (SentencePiece BPE) and 'gemma4' (BPE over SentencePiece \
+                         pieces) are supported"
                     ),
                 });
             }
@@ -619,6 +688,53 @@ mod tests {
         assert_eq!(encode(" hi"), vec![0, 1, 2]);
     }
 
+    /// Gemma 4's tokenizer: spaces become `▁`, nothing is prepended, the
+    /// merges run over the whole text, an unknown character falls back to
+    /// its byte piece, and decoding restores the text.
+    #[test]
+    fn gemma4_bpe_merges_spaces_as_markers_with_byte_fallback() {
+        let strings = |values: &[&str]| {
+            GgufMetadataValue::Array(
+                values
+                    .iter()
+                    .map(|value| GgufMetadataValue::String((*value).into()))
+                    .collect(),
+            )
+        };
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "tokenizer.ggml.model".into(),
+            GgufMetadataValue::String("gemma4".into()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.tokens".into(),
+            strings(&["<unk>", "h", "i", "\u{2581}", "hi", "\u{2581}hi", "<0x21>"]),
+        );
+        metadata.insert(
+            "tokenizer.ggml.merges".into(),
+            strings(&["h i", "\u{2581} hi"]),
+        );
+        metadata.insert(
+            "tokenizer.ggml.unknown_token_id".into(),
+            GgufMetadataValue::UInt32(0),
+        );
+        let tokenizer =
+            GgufTokenizer::from_gguf_metadata(&metadata, "gemma4-test", Some(7)).unwrap();
+        let encode = |text: &str| tokenizer.encode(EncodeInput::new(text)).unwrap().token_ids;
+        assert_eq!(encode("hi"), vec![4]);
+        assert_eq!(encode("hi hi!"), vec![4, 5, 6]);
+        let decoded = tokenizer
+            .decode(DecodeInput {
+                token_ids: vec![4, 5, 6],
+                skip_special_tokens: true,
+                clean_up_tokenization_spaces: false,
+                streaming_state: None,
+            })
+            .unwrap()
+            .text;
+        assert_eq!(decoded, "hi hi!");
+    }
+
     #[test]
     fn distinct_bos_and_eos_ids_are_both_registered() {
         let metadata = tiny_metadata_with(Some(0), Some(1));
@@ -642,10 +758,11 @@ mod tests {
 }
 
 /// Real GGUF tokenizers against their upstream `tokenizer.json`: set
-/// `MAGNETAR_GGUF_SPM_HEADER` (a SentencePiece checkpoint) or
+/// `MAGNETAR_GGUF_SPM_HEADER` (a SentencePiece checkpoint),
+/// `MAGNETAR_GGUF_GEMMA4_HEADER` (a gemma4 one) or
 /// `MAGNETAR_GGUF_BPE_HEADER` (a byte-level BPE one) to a prefix of a GGUF
-/// file holding its whole header, and `MAGNETAR_GGUF_SPM_TOKENIZER_JSON` or
-/// `MAGNETAR_GGUF_BPE_TOKENIZER_JSON` to the same checkpoint's
+/// file holding its whole header, and the matching
+/// `MAGNETAR_GGUF_{SPM,GEMMA4,BPE}_TOKENIZER_JSON` to the same checkpoint's
 /// `tokenizer.json`.
 #[cfg(test)]
 mod upstream_parity {
@@ -714,16 +831,29 @@ mod upstream_parity {
         }
     }
 
-    /// The text's own tokens; with special tokens, the beginning-of-sequence
-    /// token before them when the file declares `add_bos_token` (an
-    /// upstream `tokenizer.json` may leave that to `tokenizer_config.json`).
     #[test]
     #[ignore = "needs a real byte-level BPE GGUF header and its tokenizer.json"]
     fn byte_level_bpe_encodes_and_decodes_like_the_upstream_tokenizer_json() {
-        let (ours, upstream) = tokenizers(
+        assert_text_parity(
             "MAGNETAR_GGUF_BPE_HEADER",
             "MAGNETAR_GGUF_BPE_TOKENIZER_JSON",
         );
+    }
+
+    #[test]
+    #[ignore = "needs a real gemma4 GGUF header and its tokenizer.json"]
+    fn gemma4_encodes_and_decodes_like_the_upstream_tokenizer_json() {
+        assert_text_parity(
+            "MAGNETAR_GGUF_GEMMA4_HEADER",
+            "MAGNETAR_GGUF_GEMMA4_TOKENIZER_JSON",
+        );
+    }
+
+    /// The text's own tokens; with special tokens, the beginning-of-sequence
+    /// token before them when the file declares `add_bos_token` (an
+    /// upstream `tokenizer.json` may leave that to `tokenizer_config.json`).
+    fn assert_text_parity(header_env: &str, json_env: &str) {
+        let (ours, upstream) = tokenizers(header_env, json_env);
         let bos = ours
             .metadata()
             .special_token(SpecialTokenKind::Bos)
