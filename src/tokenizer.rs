@@ -96,7 +96,10 @@ fn byte_level_bpe(
             ))
         })?;
     let mut inner = HfTokenizerImpl::new(bpe);
-    inner.with_pre_tokenizer(Some(ByteLevel::default()));
+    // No space before the text, as llama.cpp and the checkpoints' own
+    // `tokenizer.json` (`add_prefix_space: false`): `ByteLevel::default()`
+    // adds one, which turns a leading "The" into "ĠThe".
+    inner.with_pre_tokenizer(Some(ByteLevel::new(false, true, true)));
     inner.with_decoder(Some(ByteLevel::default()));
     Ok(inner)
 }
@@ -593,6 +596,29 @@ mod tests {
         );
     }
 
+    /// A byte-level BPE adds no space before the text: "hi" is "h" "i",
+    /// not "Ġ" "h" "i", as llama.cpp and the upstream `tokenizer.json`
+    /// encode it.
+    #[test]
+    fn byte_level_bpe_adds_no_space_before_the_text() {
+        let mut metadata = tiny_metadata_with(None, None);
+        metadata.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufMetadataValue::Array(
+                ["Ġ", "h", "i"]
+                    .into_iter()
+                    .map(|token| GgufMetadataValue::String(token.into()))
+                    .collect(),
+            ),
+        );
+        let tokenizer =
+            GgufTokenizer::from_gguf_metadata(&metadata, "prefix-test", Some(3)).unwrap();
+        let encode = |text: &str| tokenizer.encode(EncodeInput::new(text)).unwrap().token_ids;
+        assert_eq!(encode("hi"), vec![1, 2]);
+        assert_eq!(encode("h i"), vec![1, 0, 2]);
+        assert_eq!(encode(" hi"), vec![0, 1, 2]);
+    }
+
     #[test]
     fn distinct_bos_and_eos_ids_are_both_registered() {
         let metadata = tiny_metadata_with(Some(0), Some(1));
@@ -615,60 +641,110 @@ mod tests {
     }
 }
 
-/// A real SentencePiece GGUF tokenizer against its upstream
-/// `tokenizer.json`: set `MAGNETAR_GGUF_SPM_HEADER` to a prefix of a GGUF
-/// file holding its whole header and `MAGNETAR_GGUF_SPM_TOKENIZER_JSON`
-/// to the same checkpoint's `tokenizer.json`.
+/// Real GGUF tokenizers against their upstream `tokenizer.json`: set
+/// `MAGNETAR_GGUF_SPM_HEADER` (a SentencePiece checkpoint) or
+/// `MAGNETAR_GGUF_BPE_HEADER` (a byte-level BPE one) to a prefix of a GGUF
+/// file holding its whole header, and `MAGNETAR_GGUF_SPM_TOKENIZER_JSON` or
+/// `MAGNETAR_GGUF_BPE_TOKENIZER_JSON` to the same checkpoint's
+/// `tokenizer.json`.
 #[cfg(test)]
-mod sentencepiece_parity {
+mod upstream_parity {
     use super::*;
+
+    const CORPUS: [&str; 10] = [
+        "The capital of France is",
+        "Hello, world!",
+        " leading space and  double  spaces",
+        "[INST] What is 2+2? [/INST]",
+        "naïve café — résumé 東京 🚀",
+        "def f(x):\n    return x * 2\n",
+        "Numbers 1234567 and 3.14159, e=mc^2.",
+        "\t\ttabs\nnewlines\r\n",
+        "Unbelievably, internationalization is antidisestablishmentarianism.",
+        "",
+    ];
+
+    fn tokenizers(header_env: &str, json_env: &str) -> (GgufTokenizer, HfTokenizerImpl) {
+        let header = std::fs::read(std::env::var(header_env).unwrap()).unwrap();
+        let artifact = magnetar_format_gguf::parse_prefix(&header, u64::MAX / 4).unwrap();
+        let ours = GgufTokenizer::from_gguf_metadata(&artifact.metadata, "parity", None).unwrap();
+        let upstream = HfTokenizerImpl::from_file(std::env::var(json_env).unwrap()).unwrap();
+        (ours, upstream)
+    }
+
+    fn encode(tokenizer: &GgufTokenizer, text: &str, special: bool) -> Vec<u32> {
+        let mut input = EncodeInput::new(text);
+        input.add_special_tokens = special;
+        tokenizer.encode(input).unwrap().token_ids
+    }
+
+    fn decode(tokenizer: &GgufTokenizer, token_ids: Vec<u32>) -> String {
+        tokenizer
+            .decode(DecodeInput {
+                token_ids,
+                skip_special_tokens: true,
+                clean_up_tokenization_spaces: false,
+                streaming_state: None,
+            })
+            .unwrap()
+            .text
+    }
 
     #[test]
     #[ignore = "needs a real SentencePiece GGUF header and its tokenizer.json"]
     fn encodes_and_decodes_like_the_upstream_tokenizer_json() {
-        let header = std::fs::read(std::env::var("MAGNETAR_GGUF_SPM_HEADER").unwrap()).unwrap();
-        let artifact = magnetar_format_gguf::parse_prefix(&header, u64::MAX / 4).unwrap();
-        let ours = GgufTokenizer::from_gguf_metadata(&artifact.metadata, "spm", None).unwrap();
-        let upstream =
-            HfTokenizerImpl::from_file(std::env::var("MAGNETAR_GGUF_SPM_TOKENIZER_JSON").unwrap())
-                .unwrap();
-        let corpus = [
-            "The capital of France is",
-            "Hello, world!",
-            " leading space and  double  spaces",
-            "[INST] What is 2+2? [/INST]",
-            "naïve café — résumé 東京 🚀",
-            "def f(x):\n    return x * 2\n",
-            "Numbers 1234567 and 3.14159, e=mc^2.",
-            "\t\ttabs\nnewlines\r\n",
-            "Unbelievably, internationalization is antidisestablishmentarianism.",
-            "",
-        ];
-        for text in corpus {
+        let (ours, upstream) = tokenizers(
+            "MAGNETAR_GGUF_SPM_HEADER",
+            "MAGNETAR_GGUF_SPM_TOKENIZER_JSON",
+        );
+        for text in CORPUS {
             for special in [true, false] {
                 let expected = upstream.encode(text, special).unwrap().get_ids().to_vec();
-                let mut input = EncodeInput::new(text);
-                input.add_special_tokens = special;
-                let actual = ours.encode(input).unwrap().token_ids;
+                let actual = encode(&ours, text, special);
                 assert_eq!(
                     actual, expected,
                     "encoding {text:?} (special tokens {special})"
                 );
-                let decoded = ours
-                    .decode(DecodeInput {
-                        token_ids: actual.clone(),
-                        skip_special_tokens: true,
-                        clean_up_tokenization_spaces: false,
-                        streaming_state: None,
-                    })
-                    .unwrap()
-                    .text;
                 assert_eq!(
-                    decoded,
+                    decode(&ours, actual),
                     upstream.decode(&expected, true).unwrap(),
                     "decoding {text:?}"
                 );
             }
+        }
+    }
+
+    /// The text's own tokens; with special tokens, the beginning-of-sequence
+    /// token before them when the file declares `add_bos_token` (an
+    /// upstream `tokenizer.json` may leave that to `tokenizer_config.json`).
+    #[test]
+    #[ignore = "needs a real byte-level BPE GGUF header and its tokenizer.json"]
+    fn byte_level_bpe_encodes_and_decodes_like_the_upstream_tokenizer_json() {
+        let (ours, upstream) = tokenizers(
+            "MAGNETAR_GGUF_BPE_HEADER",
+            "MAGNETAR_GGUF_BPE_TOKENIZER_JSON",
+        );
+        let bos = ours
+            .metadata()
+            .special_token(SpecialTokenKind::Bos)
+            .map(|token| token.id);
+        for text in CORPUS {
+            let expected = upstream.encode(text, false).unwrap().get_ids().to_vec();
+            let actual = encode(&ours, text, false);
+            assert_eq!(actual, expected, "encoding {text:?}");
+            let with_special = encode(&ours, text, true);
+            assert!(
+                with_special == expected
+                    || (bos.is_some()
+                        && with_special[..1] == [bos.unwrap()]
+                        && with_special[1..] == expected[..]),
+                "encoding {text:?} with special tokens: {with_special:?}"
+            );
+            assert_eq!(
+                decode(&ours, actual),
+                upstream.decode(&expected, true).unwrap(),
+                "decoding {text:?}"
+            );
         }
     }
 }
