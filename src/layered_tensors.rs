@@ -28,7 +28,10 @@
 //! and `attn_k_b` (`[heads, latent, key]`, each head's key rows
 //! transposed): its heads are transposed back, in the stored float type,
 //! or in `f32` from a block-quantized one, whose blocks run along the wrong
-//! dimension to be kept.
+//! dimension to be kept. The same key and value rows are also
+//! `self_attn.k_absorb` and `self_attn.v_absorb`
+//! (`cache-latent-attention-history`): not projections, so they keep the
+//! `[out, in]` orientation the absorbed decode multiplies by head.
 //!
 //! Slices are taken in stored bytes: every cut falls on a row or, for a
 //! block-quantized table, on a block boundary, so block-quantized bytes are
@@ -639,20 +642,18 @@ fn derive_latent_attention(
                 &key_nope,
             )?;
             insert_rows(derived, added, &up, &layer, "self_attn.v_proj", &values)?;
+            // The absorbed decode's tables: the same rows, kept `[out, in]`.
+            insert_rows(derived, added, &up, &layer, "self_attn.k_absorb", &key_nope)?;
+            insert_rows(derived, added, &up, &layer, "self_attn.v_absorb", &values)?;
             continue;
         }
         // `[heads, value, latent]`: already the `[heads * value, latent]`
         // value projection's bytes.
         let mut values = take_shaped(tensors, &layer, VALUE_UP_PER_HEAD, &[heads, value, latent])?;
         values.shape = vec![heads * value, latent];
-        insert_rows(
-            derived,
-            added,
-            &values,
-            &layer,
-            "self_attn.v_proj",
-            &[(0, heads * value)],
-        )?;
+        for name in ["self_attn.v_proj", "self_attn.v_absorb"] {
+            insert_rows(derived, added, &values, &layer, name, &[(0, heads * value)])?;
+        }
         let keys = take_shaped(tensors, &layer, KEY_UP_PER_HEAD, &[heads, latent, nope])?;
         if float_bytes(keys.storage_dtype).is_none()
             && dequantize(&[], keys.storage_dtype).is_none()
@@ -669,28 +670,32 @@ fn derive_latent_attention(
         } else {
             ModelDType::F32
         };
-        let name = format!("layers.{layer}.self_attn.k_nope_proj");
         let size = heads * nope * latent * float_bytes(dtype).expect("a float type") as u64;
-        derived.insert(
-            name.clone(),
-            (
-                Derivation::HeadTranspose {
-                    source: keys.name.clone(),
-                    dtype: keys.storage_dtype,
-                    heads,
-                    rows: latent,
-                    columns: nope,
-                },
+        // The key projection and, the same rows kept `[out, in]`, the
+        // absorbed decode's key table.
+        for name in ["self_attn.k_nope_proj", "self_attn.k_absorb"] {
+            let name = format!("layers.{layer}.{name}");
+            derived.insert(
+                name.clone(),
+                (
+                    Derivation::HeadTranspose {
+                        source: keys.name.clone(),
+                        dtype: keys.storage_dtype,
+                        heads,
+                        rows: latent,
+                        columns: nope,
+                    },
+                    size,
+                ),
+            );
+            added.push(derived_tensor(
+                &keys,
+                name,
+                vec![heads * nope, latent],
+                dtype,
                 size,
-            ),
-        );
-        added.push(derived_tensor(
-            &keys,
-            name,
-            vec![heads * nope, latent],
-            dtype,
-            size,
-        ));
+            ));
+        }
     }
     Ok(())
 }
