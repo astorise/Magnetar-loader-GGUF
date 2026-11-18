@@ -1656,6 +1656,22 @@ mod tests {
                         read_f32(&result, &format!("layers.{layer}.self_attn.{name}"));
                     assert_eq!(values, expected, "{form:?} layer {layer} {name}");
                 }
+                // The absorbed decode's tables: `kv_b`'s key and value rows,
+                // `[out, in]` as stored.
+                for (name, offset, width) in [("k_absorb", 0, nope), ("v_absorb", nope, value)] {
+                    let expected: Vec<f32> = (0..heads * width)
+                        .flat_map(|row| {
+                            let (head, j) = (row / width, row % width);
+                            (0..latent).map(move |l| {
+                                kv_b[((head * (nope + value) + offset + j) * latent + l) as usize]
+                            })
+                        })
+                        .collect();
+                    let (shape, values) =
+                        read_f32(&result, &format!("layers.{layer}.self_attn.{name}"));
+                    assert_eq!(shape, vec![heads * width, latent], "{form:?} {name}");
+                    assert_eq!(values, expected, "{form:?} layer {layer} {name}");
+                }
             }
             derived.push(read_f32(&result, "layers.1.self_attn.q_nope_proj").0);
         }
@@ -1682,6 +1698,13 @@ mod tests {
                 read_f32(&result, &format!("layers.{layer}.self_attn.k_nope_proj"));
             assert_eq!(shape, vec![latent, heads * nope]);
             assert_eq!(values, expected, "layer {layer}");
+            // The absorbed key table: the same values, kept `[out, in]`.
+            let (shape, values) = read_f32(&result, &format!("layers.{layer}.self_attn.k_absorb"));
+            assert_eq!(shape, vec![heads * nope, latent]);
+            let kept: Vec<f32> = (0..heads * nope)
+                .flat_map(|row| (0..latent).map(move |l| stored(row / nope, l, row % nope)))
+                .collect();
+            assert_eq!(values, kept, "layer {layer}");
         }
     }
 }
