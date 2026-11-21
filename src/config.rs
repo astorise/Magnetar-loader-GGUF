@@ -518,6 +518,14 @@ pub fn normalize(
         // A per-frequency RoPE scaling is stored as a `rope_freqs` tensor,
         // which `lib.rs` rejects; YaRN is declared by keys.
         rope_frequency_scaling,
+        // GGUF architecture identity fixes these decoder classes' MLP
+        // activation: these GGUF architectures use SiLU, while Gemma 4
+        // uses tanh-approximate GELU.
+        hidden_activation: match architecture {
+            "llama" | "qwen2" | "qwen2moe" | "deepseek2" => Some("silu".to_string()),
+            "gemma4" => Some("gelu_pytorch_tanh".to_string()),
+            _ => None,
+        },
         latent_attention: latent,
         // Patched to real tensor-derived evidence by the caller; see this
         // function's own doc comment.
@@ -792,6 +800,7 @@ mod tests {
         let llama = normalize(&metadata, 151936).unwrap();
         let qwen2 = normalize(&qwen2_0_5b_metadata(), 151936).unwrap();
         assert_eq!(llama, qwen2);
+        assert_eq!(llama.hidden_activation.as_deref(), Some("silu"));
         assert!(rope_rows_interleaved(architecture(&metadata).unwrap()));
         assert!(!rope_rows_interleaved(
             architecture(&qwen2_0_5b_metadata()).unwrap()
@@ -955,6 +964,7 @@ mod gemma4_tests {
     fn an_e2b_file_slides_shares_kv_and_rotates_a_quarter_of_full_heads() {
         let metadata = e2b();
         let base = normalize(&metadata, 262_144).unwrap();
+        assert_eq!(base.hidden_activation.as_deref(), Some("gelu_pytorch_tanh"));
         assert_eq!(base.head_dim, 256);
         assert_eq!(base.num_key_value_heads, 1);
         assert_eq!(base.intermediate_size, 6144);

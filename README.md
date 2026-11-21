@@ -19,7 +19,9 @@ export, which llama.cpp writes as `llama`, is served by the Llama
 Component). llama.cpp's converter permutes a `llama` file's query and key
 projection rows for its interleaved-pair RoPE; `src/rope_rows.rs` restores
 the upstream row order at read time, so the Component's half-split RoPE
-applies unchanged. A per-frequency RoPE scaling (`rope_freqs.weight`,
+applies unchanged. The normalized activation is SiLU for GGUF's `llama`,
+`qwen2`, `qwen2moe` and `deepseek2` decoders, and tanh-approximate GELU for
+`gemma4`. A per-frequency RoPE scaling (`rope_freqs.weight`,
 Llama 3.1+) is rejected. The tokenizer is a byte-level BPE
 (`tokenizer.ggml.model = gpt2`) or a SentencePiece BPE (`llama`, rebuilt
 from the pieces' scores with byte fallback, matching the upstream
