@@ -254,6 +254,7 @@ pub fn latent_attention(
         qk_nope_head_dim,
         qk_rope_head_dim,
         v_head_dim,
+        norm_eps: None,
     }))
 }
 
@@ -1138,6 +1139,7 @@ mod deepseek2_tests {
                 qk_nope_head_dim: 128,
                 qk_rope_head_dim: 64,
                 v_head_dim: 128,
+                norm_eps: None,
             })
         );
         assert_eq!((config.head_dim, config.num_key_value_heads), (192, 16));

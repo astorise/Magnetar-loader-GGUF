@@ -1581,6 +1581,7 @@ mod tests {
                     qk_nope_head_dim: 3,
                     qk_rope_head_dim: 2,
                     v_head_dim: 4,
+                    norm_eps: None,
                 }),
                 "{form:?}"
             );
