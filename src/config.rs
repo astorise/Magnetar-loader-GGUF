@@ -373,6 +373,7 @@ pub fn expert_layers_and_routing(
             routed_scaling_factor: float_value(metadata, &key("expert_weights_scale"))
                 .unwrap_or(1.0),
             selection_bias: has_selection_bias,
+            normalization: None,
             shared_expert_gated: false,
         }),
     ))
@@ -1177,6 +1178,7 @@ mod deepseek2_tests {
                 groups: None,
                 routed_scaling_factor: 1.0,
                 selection_bias: false,
+                normalization: None,
                 shared_expert_gated: false,
             })
         );

@@ -1615,6 +1615,7 @@ mod tests {
                     groups: None,
                     routed_scaling_factor: 1.5,
                     selection_bias: true,
+                    normalization: None,
                     shared_expert_gated: false,
                 })
             );
