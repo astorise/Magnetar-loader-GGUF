@@ -1581,6 +1581,7 @@ mod tests {
                     qk_nope_head_dim: 3,
                     qk_rope_head_dim: 2,
                     v_head_dim: 4,
+                    norm_eps: None,
                 }),
                 "{form:?}"
             );
@@ -1615,6 +1616,7 @@ mod tests {
                     groups: None,
                     routed_scaling_factor: 1.5,
                     selection_bias: true,
+                    normalization: None,
                     shared_expert_gated: false,
                 })
             );
